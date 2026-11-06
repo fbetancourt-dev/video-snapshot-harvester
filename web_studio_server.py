@@ -195,6 +195,73 @@ class WebStudioApp:
         memories = self.db_manager.get_feedback_memory(model_name=model, zone_type=zone)
         return web.json_response({"memories": memories, "count": len(memories)})
 
+    async def get_master_snapshots(self, request: web.Request) -> web.Response:
+        model = request.query.get("model", "all")
+        page = max(1, int(request.query.get("page", 1)))
+        limit = max(1, min(100, int(request.query.get("limit", 24))))
+        offset = (page - 1) * limit
+
+        def _fetch_masters():
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                base_cond = "(is_master_snapshot=1 OR zone_type='cuerpo' OR zone_type='master_frame')"
+                params = []
+                if model != "all":
+                    base_cond += " AND model_name=?"
+                    params.append(model)
+
+                c.execute(f"SELECT COUNT(*) FROM snapshots WHERE {base_cond}", tuple(params))
+                total = c.fetchone()[0]
+
+                sql = f"""
+                    SELECT s.id, s.model_name, s.image_filename, s.source_video, s.timestamp_str,
+                           s.studio_score, s.sharpness, s.status, s.created_at,
+                           (SELECT COUNT(*) FROM snapshots c WHERE c.parent_snapshot_id = s.id) as crops_count
+                    FROM snapshots s
+                    WHERE {base_cond}
+                    ORDER BY s.id DESC
+                    LIMIT ? OFFSET ?
+                """
+                c.execute(sql, tuple(params + [limit, offset]))
+                rows = [dict(r) for r in c.fetchall()]
+                return rows, total
+
+        masters, total = await asyncio.to_thread(_fetch_masters)
+        return web.json_response({
+            "masters": masters,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": (total + limit - 1) // limit if total > 0 else 1
+        })
+
+    async def get_master_crops(self, request: web.Request) -> web.Response:
+        master_id = int(request.match_info["id"])
+
+        def _fetch_crops():
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT id, model_name, image_filename, timestamp_str, source_video, sharpness, studio_score, description FROM snapshots WHERE id=?", (master_id,))
+                m_row = c.fetchone()
+                master_info = dict(m_row) if m_row else None
+
+                # Child crops: matched by parent_snapshot_id OR same video & near timestamp
+                c.execute("""
+                    SELECT id, model_name, image_filename, zone_type, studio_score, sharpness, status, review_note, description
+                    FROM snapshots
+                    WHERE parent_snapshot_id=? OR (parent_snapshot_id IS NULL AND source_video=? AND ABS(timestamp_sec - ?) < 0.2 AND id != ?)
+                    ORDER BY id ASC
+                """, (master_id, master_info.get("source_video") if master_info else "", 0.0, master_id))
+                crops = [dict(r) for r in c.fetchall()]
+                return master_info, crops
+
+        master_info, crops = await asyncio.to_thread(_fetch_crops)
+        if not master_info:
+            return web.json_response({"success": False, "error": "Master snapshot not found"}, status=404)
+        return web.json_response({"success": True, "master": master_info, "crops": crops, "crops_count": len(crops)})
+
     # ==========================================
     # Video & Contextual Scene Search Endpoints
     # ==========================================
@@ -862,7 +929,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="tabs-nav">
-      <button class="tab-btn active" data-tab="tab-atlas">📸 Atlas 32 Zonas</button>
+      <button class="tab-btn active" data-tab="tab-masters">🖼️ Snapshots Maestros & Recortes</button>
+      <button class="tab-btn" data-tab="tab-atlas">✂️ Triage por Zonas (32 Zonas)</button>
       <button class="tab-btn" data-tab="tab-video">🎬 Videos & Timeline</button>
       <button class="tab-btn" data-tab="tab-search">🔍 Buscador Contextual</button>
       <button class="tab-btn" data-tab="tab-memory">🧠 Memoria AGY</button>
@@ -876,8 +944,29 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="main-container">
 
+    <!-- TAB 0: SNAPSHOTS MAESTROS ORIGINALES Y RECORTES JERÁRQUICOS -->
+    <div id="tab-masters" class="tab-pane active">
+      <div class="filter-bar">
+        <div class="form-group">
+          <label for="master-model-select">Modelo Biométrico</label>
+          <select id="master-model-select">
+            <option value="all">Todos los Modelos</option>
+          </select>
+        </div>
+        <div id="master-stat-count" class="status-indicator">Cargando snapshots maestros...</div>
+      </div>
+
+      <div id="masters-grid" class="grid"></div>
+
+      <div class="pagination">
+        <button id="btn-master-prev" class="btn">◀ Anterior</button>
+        <span id="master-page-num" style="color: var(--text-muted); font-size: 0.9rem;">Página 1</span>
+        <button id="btn-master-next" class="btn">Siguiente ▶</button>
+      </div>
+    </div>
+
     <!-- TAB 1: ATLAS 32 ZONAS & HUMAN-IN-THE-LOOP -->
-    <div id="tab-atlas" class="tab-pane active">
+    <div id="tab-atlas" class="tab-pane">
       <div class="filter-bar">
         <div class="form-group">
           <label for="model-select">Modelo Biométrico</label>
@@ -1071,6 +1160,44 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
+  <!-- MODAL INSPECTOR: SNAPSHOT MAESTRO ➔ RECORTES ANATÓMICOS -->
+  <div id="master-crop-modal" class="modal-overlay">
+    <div class="modal-card" style="max-width: 1150px; width: 95%; height: 85vh; max-height: 850px; display: flex; flex-direction: column;">
+      <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.8rem;">
+        <div>
+          <h3 id="modal-master-title" style="margin: 0; font-size: 1.15rem; color: #60a5fa;">📸 Inspección Jerárquica de Snapshot</h3>
+          <span id="modal-master-meta" style="font-size: 0.8rem; color: var(--text-muted);">Foto original vs Recortes extraídos</span>
+        </div>
+        <button id="btn-close-master-modal" class="btn btn-secondary" style="padding: 0.3rem 0.8rem; font-size: 1rem;">✕ Cerrar</button>
+      </div>
+
+      <div style="display: flex; gap: 1.5rem; flex: 1; overflow: hidden; margin-top: 1rem;">
+        <!-- Panel Izquierdo: Foto Original Completa -->
+        <div style="flex: 1.1; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
+          <div style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; display: flex; justify-content: space-between;">
+            <span>🖼️ Fotograma Original Completo</span>
+            <span id="modal-master-sharpness">Nitidez: --</span>
+          </div>
+          <div style="flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #020617; border-radius: 6px;">
+            <img id="modal-master-img" src="" alt="Snapshot Original" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+          </div>
+          <div id="modal-master-desc" style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.5rem; max-height: 40px; overflow: hidden; text-overflow: ellipsis;"></div>
+        </div>
+
+        <!-- Panel Derecho: Recortes Anatómicos Extraídos -->
+        <div style="flex: 1.4; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <span style="font-size: 0.85rem; color: #38bdf8; font-weight: 600;">✂️ Recortes Anatómicos Extraídos (<span id="modal-crops-count">0</span>)</span>
+            <div style="display: flex; gap: 0.5rem;">
+              <button id="btn-approve-all-crops" class="btn btn-primary" style="padding: 0.25rem 0.6rem; font-size: 0.75rem;">✔ Aprobar Todos</button>
+            </div>
+          </div>
+          <div id="modal-crops-container" style="flex: 1; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.8rem; padding-right: 0.3rem;">
+            <!-- Se inyectan las tarjetas de cada recorte -->
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- REJECTION REASON MODAL -->
@@ -1103,6 +1230,10 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
   <script>
     // State
+    let currentMasterModel = "all";
+    let currentMasterPage = 1;
+    let currentActiveMasterId = null;
+
     let currentModel = "all";
     let currentZone = "all";
     let currentStatus = "pending";
@@ -1119,7 +1250,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const tabId = btn.getAttribute('data-tab');
         document.getElementById(tabId).classList.add('active');
 
-        if (tabId === 'tab-video') {
+        if (tabId === 'tab-masters') {
+          loadMasterSnapshots();
+        } else if (tabId === 'tab-atlas') {
+          loadSnapshots();
+        } else if (tabId === 'tab-video') {
           loadVideosList();
         } else if (tabId === 'tab-memory') {
           loadAgyMemory();
@@ -1134,9 +1269,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const data = await res.json();
         const models = data.models || [];
         const modelSelect = document.getElementById('model-select');
+        const masterModelSelect = document.getElementById('master-model-select');
         const searchModelSelect = document.getElementById('search-model-select');
 
         modelSelect.innerHTML = '<option value="all">Todos los Modelos</option>';
+        if (masterModelSelect) masterModelSelect.innerHTML = '<option value="all">Todos los Modelos</option>';
         searchModelSelect.innerHTML = '<option value="all">Todos los Modelos</option>';
 
         models.forEach(m => {
@@ -1145,6 +1282,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           const countNum = m.total !== undefined ? m.total : (m.count || 0);
           opt.textContent = `${m.model_name} (${countNum} recortes)`;
           modelSelect.appendChild(opt);
+
+          if (masterModelSelect) {
+            const optMaster = document.createElement('option');
+            optMaster.value = m.model_name;
+            optMaster.textContent = m.model_name;
+            masterModelSelect.appendChild(optMaster);
+          }
 
           const opt2 = document.createElement('option');
           opt2.value = m.model_name;
@@ -1155,6 +1299,165 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         console.error("Error loading models:", err);
       }
     }
+
+    // Load Master Snapshots
+    async function loadMasterSnapshots() {
+      const grid = document.getElementById('masters-grid');
+      const statBox = document.getElementById('master-stat-count');
+      grid.innerHTML = '<div style="color: var(--text-muted); padding: 2rem;">Cargando snapshots maestros...</div>';
+
+      try {
+        const res = await fetch(`/api/masters?model=${currentMasterModel}&page=${currentMasterPage}&limit=24`);
+        const data = await res.json();
+
+        statBox.textContent = `Total: ${data.total} fotos originales | Pág ${data.page}/${data.pages}`;
+        document.getElementById('master-page-num').textContent = `Página ${data.page} de ${data.pages}`;
+
+        grid.innerHTML = '';
+        if (!data.masters || data.masters.length === 0) {
+          grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; padding: 3rem; text-align: center;">No hay snapshots maestros disponibles.</div>';
+          return;
+        }
+
+        data.masters.forEach(item => {
+          const card = document.createElement('div');
+          card.className = `card ${item.status || 'pending'}`;
+          card.style.cursor = 'pointer';
+          card.innerHTML = `
+            <div class="card-img-wrapper">
+              <img class="card-img" src="/api/image/${item.id}" alt="${item.image_filename}">
+              <span class="zone-badge" style="background: rgba(14, 165, 233, 0.85);">📸 ${item.timestamp_str || 'Escena'}</span>
+              <span class="score-badge">★ ${(item.studio_score || 0).toFixed(1)}</span>
+            </div>
+            <div class="card-body">
+              <div class="card-title">
+                <span>${item.model_name}</span>
+                <span class="card-meta">Laplacian: ${(item.sharpness || 0).toFixed(1)}</span>
+              </div>
+              <p class="card-desc">${item.source_video || 'Video'}</p>
+              <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 0.8rem; color: #38bdf8; font-weight: 600;">✂️ ${item.crops_count || 0} recortes</span>
+                <button class="btn btn-secondary" style="padding: 0.25rem 0.6rem; font-size: 0.75rem;">🔍 Inspeccionar</button>
+              </div>
+            </div>
+          `;
+          card.addEventListener('click', () => inspectMasterSnapshot(item.id));
+          grid.appendChild(card);
+        });
+      } catch (err) {
+        console.error("Error loading master snapshots:", err);
+        grid.innerHTML = `<div style="color: var(--danger); padding: 2rem;">Error cargando snapshots maestros: ${err.message}</div>`;
+      }
+    }
+
+    // Inspect Master Snapshot & Its Derived Crops
+    async function inspectMasterSnapshot(masterId) {
+      currentActiveMasterId = masterId;
+      const modal = document.getElementById('master-crop-modal');
+      const container = document.getElementById('modal-crops-container');
+      container.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">Cargando recortes anatómicos derivados...</div>';
+      modal.classList.add('active');
+
+      try {
+        const res = await fetch(`/api/master/${masterId}/crops`);
+        const data = await res.json();
+        if (!data.success) {
+          alert("Error: " + data.error);
+          return;
+        }
+
+        const m = data.master;
+        document.getElementById('modal-master-title').textContent = `📸 Inspección: ${m.model_name} (${m.timestamp_str || ''})`;
+        document.getElementById('modal-master-meta').textContent = `${m.source_video || ''} | Foto ID #${m.id}`;
+        document.getElementById('modal-master-sharpness').textContent = `Nitidez: ${(m.sharpness || 0).toFixed(1)} | Calidad: ★ ${(m.studio_score || 0).toFixed(1)}`;
+        document.getElementById('modal-master-img').src = `/api/image/${m.id}`;
+        document.getElementById('modal-master-desc').textContent = m.description || '';
+        document.getElementById('modal-crops-count').textContent = data.crops_count;
+
+        container.innerHTML = '';
+        if (!data.crops || data.crops.length === 0) {
+          container.innerHTML = '<div style="color: var(--text-muted); padding: 2rem; grid-column: 1/-1; text-align: center;">No hay recortes anatómicos derivados para este snapshot.</div>';
+          return;
+        }
+
+        data.crops.forEach(c => {
+          const card = document.createElement('div');
+          card.className = `card ${c.status || 'pending'}`;
+          card.id = `modal-crop-${c.id}`;
+          card.style.margin = '0';
+          card.innerHTML = `
+            <div class="card-img-wrapper" style="height: 120px;">
+              <img class="card-img" src="/api/image/${c.id}" alt="${c.image_filename}">
+              <span class="zone-badge">${c.zone_type}</span>
+              <span class="score-badge" style="font-size: 0.65rem;">★ ${(c.studio_score || 0).toFixed(1)}</span>
+            </div>
+            <div class="card-body" style="padding: 0.5rem;">
+              <div style="font-size: 0.75rem; color: #94a3b8; display: flex; justify-content: space-between;">
+                <span>${c.zone_type}</span>
+                <span>Lap: ${(c.sharpness || 0).toFixed(1)}</span>
+              </div>
+              <div class="card-actions" style="margin-top: 0.4rem;">
+                <button class="btn btn-sm btn-verify" style="font-size: 0.7rem; padding: 0.2rem 0.4rem;" onclick="verifyCropInModal(${c.id}, event)">✔</button>
+                <button class="btn btn-sm btn-reject" style="font-size: 0.7rem; padding: 0.2rem 0.4rem;" onclick="rejectCropInModal(${c.id}, event)">✕</button>
+              </div>
+            </div>
+          `;
+          container.appendChild(card);
+        });
+      } catch (err) {
+        console.error("Error inspecting master:", err);
+      }
+    }
+
+    // Modal Crop Actions
+    async function verifyCropInModal(cropId, e) {
+      if (e) e.stopPropagation();
+      try {
+        const res = await fetch(`/api/verify/${cropId}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          const card = document.getElementById(`modal-crop-${cropId}`);
+          if (card) {
+            card.className = 'card verified';
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function rejectCropInModal(cropId, e) {
+      if (e) e.stopPropagation();
+      try {
+        const res = await fetch(`/api/reject/${cropId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: 'Descarte visual desde inspector jerárquico' })
+        });
+        const data = await res.json();
+        if (data.success) {
+          const card = document.getElementById(`modal-crop-${cropId}`);
+          if (card) {
+            card.className = 'card rejected';
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    document.getElementById('btn-close-master-modal').addEventListener('click', () => {
+      document.getElementById('master-crop-modal').classList.remove('active');
+    });
+
+    document.getElementById('btn-approve-all-crops').addEventListener('click', async () => {
+      const cards = document.querySelectorAll('#modal-crops-container .card');
+      for (const card of cards) {
+        const cid = card.id.replace('modal-crop-', '');
+        await fetch(`/api/verify/${cid}`, { method: 'POST' });
+        card.className = 'card verified';
+      }
+    });
 
     // Load Snapshots for Atlas Grid
     async function loadSnapshots() {
@@ -1582,13 +1885,44 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       loadSnapshots();
     });
 
+    const mModelSelect = document.getElementById('master-model-select');
+    if (mModelSelect) {
+      mModelSelect.addEventListener('change', (e) => {
+        currentMasterModel = e.target.value;
+        currentMasterPage = 1;
+        loadMasterSnapshots();
+      });
+    }
+
+    const btnMPrev = document.getElementById('btn-master-prev');
+    if (btnMPrev) {
+      btnMPrev.addEventListener('click', () => {
+        if (currentMasterPage > 1) {
+          currentMasterPage--;
+          loadMasterSnapshots();
+        }
+      });
+    }
+
+    const btnMNext = document.getElementById('btn-master-next');
+    if (btnMNext) {
+      btnMNext.addEventListener('click', () => {
+        currentMasterPage++;
+        loadMasterSnapshots();
+      });
+    }
+
     document.getElementById('btn-refresh').addEventListener('click', () => {
       loadModels();
+      loadMasterSnapshots();
       loadSnapshots();
     });
 
     // Init
-    loadModels().then(() => loadSnapshots());
+    loadModels().then(() => {
+      loadMasterSnapshots();
+      loadSnapshots();
+    });
   </script>
 </body>
 </html>
@@ -1604,6 +1938,8 @@ def create_app(db_path: Path) -> web.Application:
 
     # REST APIs: Models & Snapshots Triage
     app.router.add_get("/api/models", studio.get_models)
+    app.router.add_get("/api/masters", studio.get_master_snapshots)
+    app.router.add_get("/api/master/{id}/crops", studio.get_master_crops)
     app.router.add_get("/api/snapshots", studio.get_snapshots)
     app.router.add_get("/api/image/{id}", studio.get_image)
     app.router.add_post("/api/verify/{id}", studio.verify_snapshot)

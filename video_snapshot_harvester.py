@@ -897,8 +897,14 @@ class SnapshotDatabaseManager:
                 cursor.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'pending';")
             if "review_note" not in cols:
                 cursor.execute("ALTER TABLE snapshots ADD COLUMN review_note TEXT;")
+            if "parent_snapshot_id" not in cols:
+                cursor.execute("ALTER TABLE snapshots ADD COLUMN parent_snapshot_id INTEGER;")
+            if "is_master_snapshot" not in cols:
+                cursor.execute("ALTER TABLE snapshots ADD COLUMN is_master_snapshot INTEGER DEFAULT 0;")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_status ON snapshots(status);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_parent ON snapshots(parent_snapshot_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_master ON snapshots(is_master_snapshot);")
 
             # Create AGY Cognitive Feedback Memory Table
             cursor.execute("""
@@ -984,8 +990,9 @@ class SnapshotDatabaseManager:
                     silhouette_type, areola_shape, eye_color, hair_color,
                     face_shape, nose_shape, ear_shape, estimated_height_cm,
                     hand_size_category, biometric_json, agy_verdict,
-                    agy_supervision, image_blob, status, review_note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    agy_supervision, image_blob, status, review_note,
+                    parent_snapshot_id, is_master_snapshot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_filename) DO UPDATE SET
                     model_name=excluded.model_name,
                     image_path=excluded.image_path,
@@ -1016,7 +1023,9 @@ class SnapshotDatabaseManager:
                     agy_verdict=COALESCE(excluded.agy_verdict, snapshots.agy_verdict),
                     agy_supervision=COALESCE(excluded.agy_supervision, snapshots.agy_supervision),
                     image_blob=COALESCE(excluded.image_blob, snapshots.image_blob),
-                    status=COALESCE(snapshots.status, excluded.status);
+                    status=COALESCE(snapshots.status, excluded.status),
+                    parent_snapshot_id=COALESCE(excluded.parent_snapshot_id, snapshots.parent_snapshot_id),
+                    is_master_snapshot=COALESCE(excluded.is_master_snapshot, snapshots.is_master_snapshot);
             """, (
                 record.get("model_name", "unknown"),
                 record.get("image_filename"),
@@ -1049,7 +1058,9 @@ class SnapshotDatabaseManager:
                 record.get("agy_supervision", ""),
                 image_blob,
                 record.get("status", "pending"),
-                record.get("review_note", "")
+                record.get("review_note", ""),
+                record.get("parent_snapshot_id"),
+                int(record.get("is_master_snapshot", 0))
             ))
             conn.commit()
             return cursor.lastrowid
@@ -1543,6 +1554,92 @@ class AnatomicalZoneExtractor:
         return cls.crop_box(hemi, target_cx - win_w // 2, target_cy - win_h // 2, target_cx + win_w // 2, target_cy + win_h // 2)
 
     @classmethod
+    def is_valid_skin_and_texture(
+        cls,
+        crop: np.ndarray,
+        min_skin_ratio: float = 0.18,
+        min_std: float = 16.0,
+        max_blue_ratio: float = 0.40
+    ) -> bool:
+        """
+        Validates biological texture and real human skin presence,
+        strictly rejecting solid blue/green/black blankets, sheets, walls, or blurry voids.
+        """
+        if crop is None or crop.size == 0:
+            return False
+        h, w = crop.shape[:2]
+        if h < 20 or w < 20:
+            return False
+
+        # 1. Textural Variance Check (rejects flat untextured surfaces)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        std_val = float(np.std(gray))
+        if std_val < min_std:
+            return False
+
+        # 2. Human Skin Color Modeling across Fitzpatrick spectrum
+        # YCrCb: Cr in [133, 173], Cb in [77, 127]
+        ycrcb = cv2.cvtColor(crop, cv2.COLOR_BGR2YCrCb)
+        cr = ycrcb[:, :, 1]
+        cb = ycrcb[:, :, 2]
+        skin_ycrcb = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+
+        # HSV: Hue in [0, 25] or [160, 180] (warm tones), Saturation in [20, 255]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        h_ch = hsv[:, :, 0]
+        s_ch = hsv[:, :, 1]
+        skin_hsv = ((h_ch <= 25) | (h_ch >= 160)) & (s_ch >= 20)
+
+        skin_mask = skin_ycrcb | skin_hsv
+        skin_ratio = float(np.count_nonzero(skin_mask)) / float(h * w)
+
+        # 3. Explicit Cold Solid Fabric / Blue Blanket Rejection
+        b_ch = crop[:, :, 0]
+        g_ch = crop[:, :, 1]
+        r_ch = crop[:, :, 2]
+        cold_blue_mask = (b_ch > r_ch + 15) & (b_ch > g_ch)
+        cold_blue_ratio = float(np.count_nonzero(cold_blue_mask)) / float(h * w)
+        if cold_blue_ratio > max_blue_ratio:
+            return False
+
+        return skin_ratio >= min_skin_ratio
+
+    @classmethod
+    def is_sharp_and_clear(
+        cls,
+        crop: np.ndarray,
+        min_laplacian: float = 65.0,
+        max_motion_anisotropy: float = 6.0
+    ) -> bool:
+        """
+        Validates local sharpness and checks for directional motion blur.
+        Rejects blurry frames where subjects were moving fast or camera lost focus.
+        """
+        if crop is None or crop.size == 0:
+            return False
+        h, w = crop.shape[:2]
+        if h < 24 or w < 24:
+            return False
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if laplacian_var < min_laplacian:
+            return False
+
+        # Directional motion blur detection via Sobel gradients
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        var_x = float(np.var(gx)) + 1e-5
+        var_y = float(np.var(gy)) + 1e-5
+        ratio = max(var_x / var_y, var_y / var_x)
+
+        # Extreme directional stretch with low orthogonal energy indicates severe motion trail
+        if ratio > max_motion_anisotropy and laplacian_var < 140.0:
+            return False
+
+        return True
+
+    @classmethod
     def extract_all_zones(
         cls,
         frame: np.ndarray,
@@ -1553,40 +1650,42 @@ class AnatomicalZoneExtractor:
         if frame is None or frame.size == 0:
             return zones
 
-        # 0. Full body snapshot
-        zones["cuerpo"] = frame.copy()
+        # 0. Full body snapshot (if reasonably clear)
+        if cls.is_sharp_and_clear(frame, min_laplacian=35.0):
+            zones["cuerpo"] = frame.copy()
 
         # ==========================================
         # 1. CRANEOFACIAL (cara, frente, cejas, ojos, nariz, boca, menton, oreja_izq, oreja_der, cabello)
         # ==========================================
         face_img = rois_isolated.get("face") if rois_isolated else None
-        if face_img is not None and face_img.size > 0:
+        # Strict sharpness & motion blur filter: Face MUST be sharp and clearly focused
+        if face_img is not None and face_img.size > 0 and cls.is_sharp_and_clear(face_img, min_laplacian=70.0):
             zones["cara"] = face_img
             fh, fw = face_img.shape[:2]
 
-            # 1.1 Frente de la cara (Forehead: tercio superior frontal sobre cejas)
+            # 1.1 Frente de la cara (Forehead)
             frente = cls.crop_box(face_img, fw * 0.12, 0, fw * 0.88, fh * 0.36)
-            if frente is not None:
+            if frente is not None and cls.is_valid_skin_and_texture(frente, min_skin_ratio=0.30):
                 zones["frente"] = frente
 
             # 1.2 Cejas
             cejas = cls.crop_box(face_img, fw * 0.08, fh * 0.18, fw * 0.92, fh * 0.38)
-            if cejas is not None:
+            if cejas is not None and cls.is_sharp_and_clear(cejas, min_laplacian=50.0):
                 zones["cejas"] = cejas
 
             # 1.3 Ojos (franja ocular binocular)
             ojos = cls.crop_box(face_img, fw * 0.08, fh * 0.26, fw * 0.92, fh * 0.50)
-            if ojos is not None:
+            if ojos is not None and cls.is_sharp_and_clear(ojos, min_laplacian=60.0):
                 zones["ojos"] = ojos
 
             # 1.4 Nariz (tercio medio nasal)
             nariz = cls.crop_box(face_img, fw * 0.28, fh * 0.38, fw * 0.72, fh * 0.68)
-            if nariz is not None:
+            if nariz is not None and cls.is_valid_skin_and_texture(nariz, min_skin_ratio=0.25):
                 zones["nariz"] = nariz
 
             # 1.5 Boca (labios y comisuras)
             boca = cls.crop_box(face_img, fw * 0.20, fh * 0.64, fw * 0.80, fh * 0.86)
-            if boca is not None:
+            if boca is not None and cls.is_sharp_and_clear(boca, min_laplacian=50.0):
                 zones["boca"] = boca
 
             # 1.6 Mentón / Barbilla
@@ -1594,16 +1693,16 @@ class AnatomicalZoneExtractor:
             if menton is not None:
                 zones["menton"] = menton
 
-            # 1.7 Orejas (oreja_izq y oreja_der en bordes laterales de la cara)
+            # 1.7 Orejas
             oreja_izq = cls.crop_box(face_img, 0, fh * 0.25, fw * 0.22, fh * 0.70)
-            if oreja_izq is not None:
+            if oreja_izq is not None and cls.is_valid_skin_and_texture(oreja_izq, min_skin_ratio=0.15):
                 zones["oreja_izq"] = oreja_izq
 
             oreja_der = cls.crop_box(face_img, fw * 0.78, fh * 0.25, fw, fh * 0.70)
-            if oreja_der is not None:
+            if oreja_der is not None and cls.is_valid_skin_and_texture(oreja_der, min_skin_ratio=0.15):
                 zones["oreja_der"] = oreja_der
 
-            # 1.8 Cabello (coronilla y cabellera parietal)
+            # 1.8 Cabello
             cabello = cls.crop_box(face_img, 0, 0, fw, fh * 0.28)
             if cabello is not None:
                 zones["cabello"] = cabello
@@ -1612,52 +1711,52 @@ class AnatomicalZoneExtractor:
         # 2. TORSO, BUSTO, ESPALDA, OMBLIGO, CADERA
         # ==========================================
         torso_img = rois_isolated.get("torso") if rois_isolated else None
-        if torso_img is not None and torso_img.size > 0:
+        if torso_img is not None and torso_img.size > 0 and cls.is_valid_skin_and_texture(torso_img, min_skin_ratio=0.15):
             zones["torso"] = torso_img
             th, tw = torso_img.shape[:2]
 
-            # 2.1 Busto / Breast (mitad superior del torso)
+            # 2.1 Busto / Breast
             if th >= 40 and tw >= 40:
                 breast_img = torso_img[:int(th * 0.55), :]
-                zones["breast"] = breast_img
+                if cls.is_valid_skin_and_texture(breast_img, min_skin_ratio=0.20):
+                    zones["breast"] = breast_img
 
-                # 2.2 Areolas independientes (izquierda y derecha por asimetría)
-                aerola_izq = cls.isolate_areola(breast_img, is_left=True)
-                if aerola_izq is not None:
-                    zones["aerola_izq"] = aerola_izq
+                    # 2.2 Areolas independientes
+                    aerola_izq = cls.isolate_areola(breast_img, is_left=True)
+                    if aerola_izq is not None and cls.is_valid_skin_and_texture(aerola_izq, min_skin_ratio=0.15):
+                        zones["aerola_izq"] = aerola_izq
 
-                aerola_der = cls.isolate_areola(breast_img, is_left=False)
-                if aerola_der is not None:
-                    zones["aerola_der"] = aerola_der
+                    aerola_der = cls.isolate_areola(breast_img, is_left=False)
+                    if aerola_der is not None and cls.is_valid_skin_and_texture(aerola_der, min_skin_ratio=0.15):
+                        zones["aerola_der"] = aerola_der
 
-            # 2.3 Ombligo (vientre medio, franja 65%-88% del torso)
+            # 2.3 Ombligo
             if th >= 50 and tw >= 40:
                 ombligo = cls.crop_box(torso_img, tw * 0.32, th * 0.65, tw * 0.68, th * 0.88)
-                if ombligo is not None:
+                if ombligo is not None and cls.is_valid_skin_and_texture(ombligo, min_skin_ratio=0.20):
                     zones["ombligo"] = ombligo
 
-            # 2.4 Cadera (crestas ilíacas y laterales del tronco inferior)
+            # 2.4 Cadera
             if th >= 50 and tw >= 40:
                 cadera = cls.crop_box(torso_img, 0, th * 0.72, tw, th)
-                if cadera is not None:
+                if cadera is not None and cls.is_valid_skin_and_texture(cadera, min_skin_ratio=0.15):
                     zones["cadera"] = cadera
 
-            # 2.5 Espalda (dorso posterior)
+            # 2.5 Espalda
             espalda = cls.crop_box(torso_img, tw * 0.15, th * 0.10, tw * 0.85, th * 0.70)
-            if espalda is not None:
+            if espalda is not None and cls.is_valid_skin_and_texture(espalda, min_skin_ratio=0.15):
                 zones["espalda"] = espalda
 
         # ==========================================
         # 3. PELVIS, ENTREPIERNA Y GLÚTEOS
         # ==========================================
         hg_img = rois_isolated.get("hips_glutes") if rois_isolated else None
-        if hg_img is not None and hg_img.size > 0:
+        if hg_img is not None and hg_img.size > 0 and cls.is_valid_skin_and_texture(hg_img, min_skin_ratio=0.15):
             zones["pompi"] = hg_img
             hgh, hgw = hg_img.shape[:2]
 
-            # 3.1 Entrepierna (Ingle / Crotch / cara medial proximal de muslos)
             entrepierna = cls.crop_box(hg_img, hgw * 0.28, hgh * 0.25, hgw * 0.72, hgh * 0.80)
-            if entrepierna is not None:
+            if entrepierna is not None and cls.is_valid_skin_and_texture(entrepierna, min_skin_ratio=0.20):
                 zones["entrepierna"] = entrepierna
 
         # ==========================================
@@ -1665,99 +1764,102 @@ class AnatomicalZoneExtractor:
         # ==========================================
         if kpts is not None and len(kpts) >= 17:
             # 4.1 Brazo Izquierdo (hombro 5, codo 7, muñeca 9)
-            arm_l = [kpts[i] for i in [5, 7, 9] if kpts[i][2] > 0.20]
+            arm_l = [kpts[i] for i in [5, 7, 9] if kpts[i][2] >= 0.40]
             if len(arm_l) >= 2:
                 xs, ys = [p[0] for p in arm_l], [p[1] for p in arm_l]
-                pad = max(max(xs) - min(xs), max(ys) - min(ys), 25.0) * 0.22
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.25
                 crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.15):
                     zones["brazo_izq"] = crop
 
             # 4.2 Brazo Derecho (hombro 6, codo 8, muñeca 10)
-            arm_r = [kpts[i] for i in [6, 8, 10] if kpts[i][2] > 0.20]
+            arm_r = [kpts[i] for i in [6, 8, 10] if kpts[i][2] >= 0.40]
             if len(arm_r) >= 2:
                 xs, ys = [p[0] for p in arm_r], [p[1] for p in arm_r]
-                pad = max(max(xs) - min(xs), max(ys) - min(ys), 25.0) * 0.22
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.25
                 crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.15):
                     zones["brazo_der"] = crop
 
             # 4.3 Manos (mano_izq en muñeca 9, mano_der en muñeca 10)
-            if kpts[9][2] > 0.25:
+            if kpts[9][2] >= 0.50:
                 mx, my = kpts[9][0], kpts[9][1]
-                mr = 45.0
+                mr = 50.0
                 crop = cls.crop_box(frame, mx - mr, my - mr, mx + mr, my + mr)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20):
                     zones["mano_izq"] = crop
 
-            if kpts[10][2] > 0.25:
+            if kpts[10][2] >= 0.50:
                 mx, my = kpts[10][0], kpts[10][1]
-                mr = 45.0
+                mr = 50.0
                 crop = cls.crop_box(frame, mx - mr, my - mr, mx + mr, my + mr)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20):
                     zones["mano_der"] = crop
 
-            # 4.4 Pierna Izquierda (cadera 11, rodilla 13, tobillo 15)
-            leg_l = [kpts[i] for i in [11, 13, 15] if kpts[i][2] > 0.20]
-            if len(leg_l) >= 2:
-                xs, ys = [p[0] for p in leg_l], [p[1] for p in leg_l]
-                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.18
+            # 4.4 Pierna Izquierda vs Muslo Izquierdo
+            # Strict anatomical rule: Requires Hip (11), Knee (13) AND Ankle (15) all >= 0.45
+            hip_l, knee_l, ankle_l = kpts[11], kpts[13], kpts[15]
+            if hip_l[2] >= 0.45 and knee_l[2] >= 0.45 and ankle_l[2] >= 0.45:
+                xs = [hip_l[0], knee_l[0], ankle_l[0]]
+                ys = [hip_l[1], knee_l[1], ankle_l[1]]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 40.0) * 0.22
                 crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.15):
                     zones["pierna_izq"] = crop
-
-            # 4.5 Pierna Derecha (cadera 12, rodilla 14, tobillo 16)
-            leg_r = [kpts[i] for i in [12, 14, 16] if kpts[i][2] > 0.20]
-            if len(leg_r) >= 2:
-                xs, ys = [p[0] for p in leg_r], [p[1] for p in leg_r]
-                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.18
-                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
-                if crop is not None:
-                    zones["pierna_der"] = crop
-
-            # 4.6 Muslos (muslo_izq entre cadera 11 y rodilla 13, muslo_der entre cadera 12 y rodilla 14)
-            if kpts[11][2] > 0.20 and kpts[13][2] > 0.20:
-                xs = [kpts[11][0], kpts[13][0]]
-                ys = [kpts[11][1], kpts[13][1]]
-                pad = max(abs(xs[1] - xs[0]), 30.0) * 0.35
+            elif hip_l[2] >= 0.45 and knee_l[2] >= 0.45:
+                # Incomplete limb: ONLY Thigh (muslo)
+                xs = [hip_l[0], knee_l[0]]
+                ys = [hip_l[1], knee_l[1]]
+                pad = max(abs(xs[1] - xs[0]), abs(ys[1] - ys[0]), 30.0) * 0.25
                 crop = cls.crop_box(frame, min(xs) - pad, min(ys) - 10, max(xs) + pad, max(ys) + 15)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20):
                     zones["muslo_izq"] = crop
 
-            if kpts[12][2] > 0.20 and kpts[14][2] > 0.20:
-                xs = [kpts[12][0], kpts[14][0]]
-                ys = [kpts[12][1], kpts[14][1]]
-                pad = max(abs(xs[1] - xs[0]), 30.0) * 0.35
+            # 4.5 Pierna Derecha vs Muslo Derecho
+            hip_r, knee_r, ankle_r = kpts[12], kpts[14], kpts[16]
+            if hip_r[2] >= 0.45 and knee_r[2] >= 0.45 and ankle_r[2] >= 0.45:
+                xs = [hip_r[0], knee_r[0], ankle_r[0]]
+                ys = [hip_r[1], knee_r[1], ankle_r[1]]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 40.0) * 0.22
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.15):
+                    zones["pierna_der"] = crop
+            elif hip_r[2] >= 0.45 and knee_r[2] >= 0.45:
+                # Incomplete limb: ONLY Thigh (muslo)
+                xs = [hip_r[0], knee_r[0]]
+                ys = [hip_r[1], knee_r[1]]
+                pad = max(abs(xs[1] - xs[0]), abs(ys[1] - ys[0]), 30.0) * 0.25
                 crop = cls.crop_box(frame, min(xs) - pad, min(ys) - 10, max(xs) + pad, max(ys) + 15)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20):
                     zones["muslo_der"] = crop
 
-            # 4.7 Tobillos (tobillo_izq en 15, tobillo_der en 16)
-            if kpts[15][2] > 0.25:
+            # 4.6 Tobillos (tobillo_izq en 15, tobillo_der en 16)
+            if kpts[15][2] >= 0.55:
                 tx, ty = kpts[15][0], kpts[15][1]
-                tr = 40.0
+                tr = 45.0
                 crop = cls.crop_box(frame, tx - tr, ty - tr, tx + tr, ty + tr)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.18):
                     zones["tobillo_izq"] = crop
 
-            if kpts[16][2] > 0.25:
+            if kpts[16][2] >= 0.55:
                 tx, ty = kpts[16][0], kpts[16][1]
-                tr = 40.0
+                tr = 45.0
                 crop = cls.crop_box(frame, tx - tr, ty - tr, tx + tr, ty + tr)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.18):
                     zones["tobillo_der"] = crop
 
-            # 4.8 Pies (pie_izq y pie_der desde el tobillo hacia abajo)
-            if kpts[15][2] > 0.20:
+            # 4.7 Pies (pie_izq y pie_der desde el tobillo hacia abajo)
+            # High confidence threshold + skin validation to prevent blue blanket/bedsheet false positives
+            if kpts[15][2] >= 0.55:
                 tx, ty = kpts[15][0], kpts[15][1]
                 crop = cls.crop_box(frame, tx - 45, ty - 15, tx + 45, ty + 65)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20) and cls.is_sharp_and_clear(crop, min_laplacian=40.0):
                     zones["pie_izq"] = crop
 
-            if kpts[16][2] > 0.20:
+            if kpts[16][2] >= 0.55:
                 tx, ty = kpts[16][0], kpts[16][1]
                 crop = cls.crop_box(frame, tx - 45, ty - 15, tx + 45, ty + 65)
-                if crop is not None:
+                if crop is not None and cls.is_valid_skin_and_texture(crop, min_skin_ratio=0.20) and cls.is_sharp_and_clear(crop, min_laplacian=40.0):
                     zones["pie_der"] = crop
 
         return zones
@@ -2208,16 +2310,19 @@ class VideoSnapshotHarvester:
                 "silhouette": silhouette_info
             },
             "agy_verdict": "PENDING",
-            "agy_supervision": ""
+            "agy_supervision": "",
+            "is_master_snapshot": 1,
+            "parent_snapshot_id": None
         }
         records.append(main_record)
 
+        master_id = None
         if self.db_manager:
             img_blob = None
             if self.store_blob:
                 with open(final_dest, "rb") as f:
                     img_blob = f.read()
-            self.db_manager.upsert_snapshot(main_record, image_blob=img_blob)
+            master_id = self.db_manager.upsert_snapshot(main_record, image_blob=img_blob)
 
         # 3. Extended Multi-Zone Anatomical Crops (28 granular regions)
         if self.crop_regions:
@@ -2239,6 +2344,12 @@ class VideoSnapshotHarvester:
                 os.replace(crop_tmp, crop_dest)
                 DesktopThumbnailManager.sync_thumbnail(crop_dest)
 
+                # Local sharpness & brightness of the specific crop
+                z_gray = cv2.cvtColor(z_img, cv2.COLOR_BGR2GRAY) if len(z_img.shape) == 3 else z_img
+                local_sharpness = round(float(cv2.Laplacian(z_gray, cv2.CV_64F).var()), 2)
+                local_brightness = round(float(np.mean(z_gray)), 2)
+                local_contrast = round(float(np.std(z_gray)), 2)
+
                 crop_skin = SkinToneAnalyzer.analyze_skin(z_img) if z_name in (
                     "cara", "torso", "breast", "pompi", "frente", "espalda", "ombligo", "muslo_izq", "muslo_der", "pierna_izq", "pierna_der"
                 ) else skin_info
@@ -2250,7 +2361,7 @@ class VideoSnapshotHarvester:
                     zone_type=z_name,
                     timestamp_str=t_str,
                     studio_score=metrics.get("studio_score", 0.0),
-                    sharpness=metrics.get("sharpness", 0.0),
+                    sharpness=local_sharpness,
                     skin_info=crop_skin,
                     face_info=crop_face if z_name == "cara" else None,
                     anthro_info=anthro_info if z_name in ("cuerpo", "brazos") else None,
@@ -2270,9 +2381,9 @@ class VideoSnapshotHarvester:
                     "timestamp_sec": round(timestamp_sec, 3),
                     "timestamp_str": t_str,
                     "studio_score": metrics.get("studio_score", 0.0),
-                    "sharpness": metrics.get("sharpness", 0.0),
-                    "brightness": metrics.get("brightness", 0.0),
-                    "contrast": metrics.get("contrast", 0.0),
+                    "sharpness": local_sharpness,
+                    "brightness": local_brightness,
+                    "contrast": local_contrast,
                     "skin_tone_hex": crop_skin["hex"],
                     "fitzpatrick_type": crop_skin["fitzpatrick_type"],
                     "complexion_smoothness": crop_skin["complexion_smoothness"],
@@ -2292,7 +2403,9 @@ class VideoSnapshotHarvester:
                         "silhouette": silhouette_info if z_name in ("cuerpo", "torso") else None
                     },
                     "agy_verdict": "PENDING",
-                    "agy_supervision": ""
+                    "agy_supervision": "",
+                    "is_master_snapshot": 0,
+                    "parent_snapshot_id": master_id
                 }
                 records.append(crop_record)
 
