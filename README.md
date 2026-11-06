@@ -1,18 +1,25 @@
 # Video Snapshot Harvester (`video-snapshot` / `video-harvest`)
 
-High-precision forensic video keyframe and studio snapshot harvester designed to extract, filter, and curate training datasets for computer vision, biometric enrollment, and somatotype recognition.
+High-precision forensic video keyframe and studio snapshot harvester designed to extract, filter, morphometrically analyze, and curate training datasets for computer vision, biometric enrollment, anthropometrics, and somatotype recognition.
 
 ## Features
 
 - **Traceable Naming Protocol**: Every output snapshot embeds the original video filename and exact extracted timestamp: `<video_name>_snap_t<MM>m<SS>s_<millis>ms.jpg`.
-- **Studio Aesthetic & Pose Quality Scoring**: Evaluates sharpness (Laplacian variance), studio lighting balance, dynamic contrast, pose stillness, and biometric presence to capture flattering, high-clarity moments.
-- **Diverse Situation Discovery**: Segments videos into $N$ distinct situations/scenes and isolates the single peak studio moment for each situation.
-- **Explicit Timestamp Extraction**: Direct capture at arbitrary millisecond-precise timestamps (`--timestamps "00:01:23.500, 00:04:12"`).
-- **Perceptual Deduplication**: 64-bit difference hash (dHash) prevents saving duplicate stationary frames.
-- **Anatomical Cropping**: Integrates with YOLOv8-Pose and YuNet to generate clean sub-region crops (`crops/face`, `crops/torso`, `crops/hips`).
-- **Studio Contact Sheet**: Builds a high-resolution HUD grid visual summary (`*_STUDIO_CONTACT_SHEET.jpg`) for fast visual curation.
+- **Studio Aesthetic & Pose Quality Scoring**: Evaluates sharpness (Laplacian variance), studio lighting balance, dynamic contrast, pose stillness, and biometric presence.
+- **Anatomical Multi-Zone Breakdown**: Isolates 9 anatomical zones: `cara`, `cuerpo`, `breast`, `pompi`, `frente`, `aerola`, `piernas`, `brazos`, `torso`.
+- **Comprehensive Morphometrics & Anthropometry**:
+  - **Facial Features**: Eyebrows (style, arch, color), Eye color (iris RGB/Hex), Hair color, Face shape (Oval, Round, Heart, Square, Oblong, Diamond), Nose shape (Straight, Upturned, Broad), Ear shape (Lobe type, Proportions), Lips fullness.
+  - **Areola Morphology**: Shape classification (Circular, Oval Horizontal/Vertical, Elliptical), aspect ratio, eccentricity.
+  - **Skin Tone & Complexion**: RGB/Lab color, HEX, ITA angle, Fitzpatrick phototype (Type I–VI), texture smoothness.
+  - **Silhouette & Somatotype**: Body archetype (Hourglass, Pear, Inverted Triangle, Athletic/Rectangle), WHR, SHR.
+  - **Anthropometry**: Hand size (Small, Proportional, Long) and hand-to-face proportion, Estimated stature in cm via cephalic canon.
+- **Structured JSON Catalog**: Generates `SNAPSHOTS_METADATA.json` with all morphological vectors.
+- **Persistent SQLite Database (`--enable-db` / `--db`)**: Stores full metadata, indexable queries, and optional raw binary image BLOBs (`--store-blob`).
+- **Antigravity Agent Supervision (`--agy-supervision`)**: Dispatches candidate snapshots to the `agy` CLI for cognitive supervision and caption enhancement.
+- **Diverse Situation Discovery**: Segments videos into $N$ distinct situations/scenes and isolates the single peak studio moment for each.
+- **Direct Timestamps Extraction**: Supports custom millisecond-precise timestamps (`--timestamps "00:01:23.500, 00:04:12"`).
+- **Studio Contact Sheet**: Builds a high-resolution HUD grid visual summary (`*_STUDIO_CONTACT_SHEET.jpg`).
 - **Desktop Thumbnail Pre-caching**: Synchronously populates GNOME/Nautilus 512px and 256px caches.
-- **Seamless Dataset & Training Integration**: Direct integration with `model-media` for automated profile re-training.
 
 ## Installation & Symlinks
 
@@ -32,14 +39,11 @@ python3 -B -m unittest discover -s tests -v
 ## Usage Examples
 
 ```bash
-# General sampling every 2 seconds with sub-anatomical crops
-video-snapshot /path/to/stream.mp4 -m eva --fps 0.5 --crop-regions
+# Studio mode discovering 8 situations with full anatomical crops, SQLite DB, and AGY supervision
+video-snapshot /path/to/stream.mp4 -m eva --studio --situations 8 --crop-regions --enable-db --agy-supervision
 
-# Studio mode discovering 8 diverse situations
-video-snapshot /path/to/video.mp4 -m eva --studio --situations 8 --crop-regions
-
-# Harvest specific timestamps chosen by user or AI assistant
-video-snapshot /path/to/video.mp4 -m eva --timestamps "00:01:24.500,00:05:10,00:09:42.250"
+# Extract exact studio timestamps with image BLOBs inside SQLite
+video-snapshot /path/to/video.mp4 -m eva --timestamps "00:01:24.500,00:05:10,00:09:42" --crop-regions --enable-db --store-blob
 
 # Generate studio contact sheet only
 video-snapshot /path/to/video.mp4 --studio --situations 12 --contact-sheet
