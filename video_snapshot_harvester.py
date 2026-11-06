@@ -2072,7 +2072,7 @@ class VideoSnapshotHarvester:
         self,
         output_dir: Path,
         mode: str = "interval",
-        min_sharpness: float = 75.0,
+        min_sharpness: float = 35.0,
         max_snapshots: int = 100,
         dedup_threshold: int = 8,
         only_person: bool = False,
@@ -2903,7 +2903,7 @@ def main():
     # Extraction Engine Options
     parser.add_argument("--mode", choices=["keyframes", "scene", "interval"], default="interval", help="Extraction strategy (default: interval)")
     parser.add_argument("--fps", type=float, default=0.5, help="Sampling rate in frames per second (default: 0.5 = 1 frame/2s)")
-    parser.add_argument("--min-sharpness", type=float, default=75.0, help="Laplacian variance threshold to reject motion blur (default: 75.0)")
+    parser.add_argument("--min-sharpness", type=float, default=35.0, help="Laplacian variance threshold to reject motion blur (default: 35.0)")
     parser.add_argument("--max-snapshots", type=int, default=100, help="Maximum number of snapshots to harvest (default: 100)")
     parser.add_argument("--dhash-threshold", type=int, default=8, help="Max Hamming distance to reject duplicate frames (default: 8)")
     parser.add_argument("--only-person", action="store_true", help="Filter: only save frames with verified human pose")
@@ -3108,12 +3108,20 @@ def main():
                 ts_list = [t.strip() for t in args.timestamps.split(",") if t.strip()]
                 result = harvester.harvest_from_timestamps(local_sources[0], ts_list)
             elif len(local_sources) == 1 and Path(local_sources[0]).is_file() and not args.recursive:
-                result = harvester.harvest_from_video(
-                    video_input=local_sources[0],
-                    start_time=args.start,
-                    end_time=args.end,
-                    fps_interval=args.fps
-                )
+                if harvester.studio_mode or args.studio:
+                    result = harvester.harvest_studio_situations(
+                        video_input=local_sources[0],
+                        num_situations=args.situations_per_video or args.situations,
+                        start_time=args.start,
+                        end_time=args.end
+                    )
+                else:
+                    result = harvester.harvest_from_video(
+                        video_input=local_sources[0],
+                        start_time=args.start,
+                        end_time=args.end,
+                        fps_interval=args.fps
+                    )
             else:
                 result = harvester.harvest_multi_source(
                     sources=local_sources,
