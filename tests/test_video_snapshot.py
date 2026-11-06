@@ -255,5 +255,118 @@ class TestEndToEndVideoHarvesting(unittest.TestCase):
         self.assertGreater(db.count(), 0)
 
 
+class TestAnatomicalZoneExtractor(unittest.TestCase):
+    def test_granular_lateral_zones_extraction(self):
+        from video_snapshot_harvester import AnatomicalZoneExtractor
+
+        frame = np.full((720, 1280, 3), 120, dtype=np.uint8)
+        # Mock facial crop
+        face_crop = np.full((200, 160, 3), 180, dtype=np.uint8)
+        # Mock torso crop
+        torso_crop = np.full((300, 240, 3), 170, dtype=np.uint8)
+        # Mock hips crop
+        hips_crop = np.full((250, 260, 3), 160, dtype=np.uint8)
+
+        rois = {
+            "face": face_crop,
+            "torso": torso_crop,
+            "hips_glutes": hips_crop
+        }
+
+        # Mock COCO-17 keypoints
+        kpts = np.zeros((17, 3), dtype=float)
+        # Shoulders (5, 6)
+        kpts[5] = [500, 200, 0.95]
+        kpts[6] = [700, 200, 0.95]
+        # Elbows (7, 8)
+        kpts[7] = [460, 320, 0.90]
+        kpts[8] = [740, 320, 0.90]
+        # Wrists (9, 10)
+        kpts[9] = [430, 420, 0.88]
+        kpts[10] = [770, 420, 0.88]
+        # Hips (11, 12)
+        kpts[11] = [530, 430, 0.95]
+        kpts[12] = [670, 430, 0.95]
+        # Knees (13, 14)
+        kpts[13] = [540, 560, 0.90]
+        kpts[14] = [660, 560, 0.90]
+        # Ankles (15, 16)
+        kpts[15] = [545, 680, 0.85]
+        kpts[16] = [655, 680, 0.85]
+
+        zones = AnatomicalZoneExtractor.extract_all_zones(frame, rois, kpts=kpts)
+
+        # Facial zones
+        self.assertIn("cara", zones)
+        self.assertIn("frente", zones)
+        self.assertIn("cejas", zones)
+        self.assertIn("ojos", zones)
+        self.assertIn("nariz", zones)
+        self.assertIn("boca", zones)
+        self.assertIn("menton", zones)
+        self.assertIn("oreja_izq", zones)
+        self.assertIn("oreja_der", zones)
+        self.assertIn("cabello", zones)
+
+        # Torso & trunk zones
+        self.assertIn("torso", zones)
+        self.assertIn("breast", zones)
+        self.assertIn("aerola_izq", zones)
+        self.assertIn("aerola_der", zones)
+        self.assertIn("ombligo", zones)
+        self.assertIn("cadera", zones)
+        self.assertIn("espalda", zones)
+
+        # Pelvic & intimate
+        self.assertIn("entrepierna", zones)
+        self.assertIn("pompi", zones)
+
+        # Upper limbs (left & right)
+        self.assertIn("brazo_izq", zones)
+        self.assertIn("brazo_der", zones)
+        self.assertIn("mano_izq", zones)
+        self.assertIn("mano_der", zones)
+
+        # Lower limbs (left & right)
+        self.assertIn("pierna_izq", zones)
+        self.assertIn("pierna_der", zones)
+        self.assertIn("muslo_izq", zones)
+        self.assertIn("muslo_der", zones)
+        self.assertIn("tobillo_izq", zones)
+        self.assertIn("tobillo_der", zones)
+        self.assertIn("pie_izq", zones)
+        self.assertIn("pie_der", zones)
+
+
+class TestGoogleDriveSourceAndOrigin(unittest.TestCase):
+    def test_configured_remotes_detection(self):
+        from video_snapshot_harvester import GoogleDriveSource
+        remotes = GoogleDriveSource.get_configured_remotes()
+        self.assertIsInstance(remotes, list)
+        self.assertGreater(len(remotes), 0)
+
+    def test_model_alias_resolution(self):
+        from video_snapshot_harvester import GoogleDriveSource
+        aliases_uw = GoogleDriveSource._model_aliases("uwxo")
+        self.assertIn("uwuxo", aliases_uw)
+
+        aliases_tanni = GoogleDriveSource._model_aliases("tanni_bc")
+        self.assertIn("taanni_bc", aliases_tanni)
+
+        aliases_sunshine = GoogleDriveSource._model_aliases("sunshine13_")
+        self.assertIn("sunshine13__", aliases_sunshine)
+
+    def test_clean_staging_purges_temporary_files(self):
+        from video_snapshot_harvester import GoogleDriveSource
+        tmp_dir = tempfile.mkdtemp()
+        dummy_file = Path(tmp_dir) / "dummy_staged.mp4"
+        dummy_file.write_text("sample content")
+        self.assertTrue(dummy_file.is_file())
+
+        GoogleDriveSource.clean_staging([dummy_file])
+        self.assertFalse(dummy_file.is_file())
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

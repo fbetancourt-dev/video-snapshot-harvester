@@ -76,15 +76,38 @@ except ImportError:
 
 
 ANATOMICAL_ZONES = [
-    "cara",
     "cuerpo",
-    "breast",
-    "pompi",
+    "cara",
     "frente",
-    "aerola",
-    "piernas",
-    "brazos",
-    "torso"
+    "ojos",
+    "cejas",
+    "nariz",
+    "boca",
+    "menton",
+    "oreja_izq",
+    "oreja_der",
+    "cabello",
+    "torso",
+    "espalda",
+    "breast",
+    "aerola_izq",
+    "aerola_der",
+    "ombligo",
+    "cadera",
+    "entrepierna",
+    "pompi",
+    "brazo_izq",
+    "brazo_der",
+    "mano_izq",
+    "mano_der",
+    "pierna_izq",
+    "pierna_der",
+    "muslo_izq",
+    "muslo_der",
+    "tobillo_izq",
+    "tobillo_der",
+    "pie_izq",
+    "pie_der"
 ]
 
 
@@ -524,15 +547,38 @@ def generate_snapshot_description(
     desc_templates = {
         "cuerpo": f"Full body studio pose of {model_name} captured at {timestamp_str}. Balanced lighting with visible silhouette.",
         "cara": f"High-resolution facial portrait of {model_name} at {timestamp_str} with eye contact.",
+        "frente": f"Forehead craniofacial anatomical region of {model_name} at {timestamp_str}.",
+        "ojos": f"Detailed eye and orbital region crop of {model_name} at {timestamp_str}.",
+        "cejas": f"Eyebrow architecture crop of {model_name} at {timestamp_str}.",
+        "nariz": f"Nasal bridge and morphology crop of {model_name} at {timestamp_str}.",
+        "boca": f"Lips and mouth expression crop of {model_name} at {timestamp_str}.",
+        "menton": f"Chin and jawline lower facial crop of {model_name} at {timestamp_str}.",
+        "oreja_izq": f"Left ear anatomical profile crop of {model_name} at {timestamp_str}.",
+        "oreja_der": f"Right ear anatomical profile crop of {model_name} at {timestamp_str}.",
+        "cabello": f"Hair texture and crown region crop of {model_name} at {timestamp_str}.",
+        "torso": f"Mid-body torso and waist somatotype crop of {model_name} at {timestamp_str}.",
+        "espalda": f"Back and dorsal posterior somatotype region of {model_name} at {timestamp_str}.",
         "breast": f"Upper torso and breast anatomical somatotype region of {model_name} at {timestamp_str}.",
-        "pompi": f"Hip contour and glute anatomical somatotype region (rear/posterior) of {model_name} at {timestamp_str}.",
-        "frente": f"Frontal pelvic and hip somatotype anatomical region (front) of {model_name} at {timestamp_str}.",
-        "aerola": f"Detailed chest aerola region somatotype crop of {model_name} at {timestamp_str}.",
-        "piernas": f"Lower body and leg somatotype anatomy crop of {model_name} at {timestamp_str}.",
-        "brazos": f"Upper extremity and arm anatomy crop of {model_name} at {timestamp_str}.",
-        "torso": f"Mid-body torso and waist somatotype crop of {model_name} at {timestamp_str}."
+        "aerola_izq": f"Left chest areola region somatotype crop of {model_name} at {timestamp_str}.",
+        "aerola_der": f"Right chest areola region somatotype crop of {model_name} at {timestamp_str}.",
+        "ombligo": f"Navel and mid-abdominal region crop of {model_name} at {timestamp_str}.",
+        "cadera": f"Hip contour and iliac crest somatotype crop of {model_name} at {timestamp_str}.",
+        "entrepierna": f"Crotch and upper inner thigh intimate anatomy crop of {model_name} at {timestamp_str}.",
+        "pompi": f"Glute and posterior contour anatomy crop of {model_name} at {timestamp_str}.",
+        "brazo_izq": f"Left arm and upper extremity crop of {model_name} at {timestamp_str}.",
+        "brazo_der": f"Right arm and upper extremity crop of {model_name} at {timestamp_str}.",
+        "mano_izq": f"Left hand and palm anatomy crop of {model_name} at {timestamp_str}.",
+        "mano_der": f"Right hand and palm anatomy crop of {model_name} at {timestamp_str}.",
+        "pierna_izq": f"Left leg lower limb somatotype crop of {model_name} at {timestamp_str}.",
+        "pierna_der": f"Right leg lower limb somatotype crop of {model_name} at {timestamp_str}.",
+        "muslo_izq": f"Left thigh and quadriceps anatomy crop of {model_name} at {timestamp_str}.",
+        "muslo_der": f"Right thigh and quadriceps anatomy crop of {model_name} at {timestamp_str}.",
+        "tobillo_izq": f"Left ankle joint crop of {model_name} at {timestamp_str}.",
+        "tobillo_der": f"Right ankle joint crop of {model_name} at {timestamp_str}.",
+        "pie_izq": f"Left foot anatomy crop of {model_name} at {timestamp_str}.",
+        "pie_der": f"Right foot anatomy crop of {model_name} at {timestamp_str}."
     }
-    base = desc_templates.get(zone_type, f"Biometric training image of {model_name} at {timestamp_str}.")
+    base = desc_templates.get(zone_type, f"Biometric training image of {model_name} ({zone_type}) at {timestamp_str}.")
 
     tags = []
     if skin_info and skin_info.get("tone_label") != "Unknown":
@@ -797,6 +843,10 @@ class SnapshotDatabaseManager:
     def _init_db(self):
         with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode = WAL;")
+            cursor.execute("PRAGMA synchronous = NORMAL;")
+            cursor.execute("PRAGMA busy_timeout = 5000;")
+            cursor.execute("PRAGMA journal_size_limit = 67108864;")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -839,6 +889,86 @@ class SnapshotDatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_tsec ON snapshots(timestamp_sec);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_skin ON snapshots(fitzpatrick_type);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_silh ON snapshots(silhouette_type);")
+
+            # Check and add review status and note columns if not present
+            cursor.execute("PRAGMA table_info(snapshots);")
+            cols = [col[1] for col in cursor.fetchall()]
+            if "status" not in cols:
+                cursor.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'pending';")
+            if "review_note" not in cols:
+                cursor.execute("ALTER TABLE snapshots ADD COLUMN review_note TEXT;")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_status ON snapshots(status);")
+
+            # Create AGY Cognitive Feedback Memory Table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS agy_feedback_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER,
+                    model_name TEXT NOT NULL,
+                    zone_type TEXT NOT NULL,
+                    error_category TEXT NOT NULL,
+                    user_note TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    applied_count INTEGER DEFAULT 0
+                );
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_fdbk_model ON agy_feedback_memory(model_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_fdbk_zone ON agy_feedback_memory(zone_type);")
+
+            # Create Timeline Minute Scenes Table & Full-Text Search (FTS5)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS video_scenes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    video_filename TEXT NOT NULL,
+                    video_path TEXT NOT NULL,
+                    minute_index INTEGER NOT NULL,
+                    timestamp_sec REAL NOT NULL,
+                    timestamp_str TEXT NOT NULL,
+                    scene_description TEXT NOT NULL,
+                    tags TEXT,
+                    studio_score REAL DEFAULT 0.0,
+                    image_blob BLOB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(video_filename, minute_index)
+                );
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scenes_model ON video_scenes(model_name);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scenes_vid ON video_scenes(video_filename);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scenes_min ON video_scenes(minute_index);")
+
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS scenes_fts USING fts5(
+                    scene_description,
+                    tags,
+                    model_name,
+                    video_filename,
+                    content='video_scenes',
+                    content_rowid='id'
+                );
+            """)
+
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS scenes_ai AFTER INSERT ON video_scenes BEGIN
+                  INSERT INTO scenes_fts(rowid, scene_description, tags, model_name, video_filename)
+                  VALUES (new.id, new.scene_description, new.tags, new.model_name, new.video_filename);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS scenes_ad AFTER DELETE ON video_scenes BEGIN
+                  INSERT INTO scenes_fts(scenes_fts, rowid, scene_description, tags, model_name, video_filename)
+                  VALUES('delete', old.id, old.scene_description, old.tags, old.model_name, old.video_filename);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS scenes_au AFTER UPDATE ON video_scenes BEGIN
+                  INSERT INTO scenes_fts(scenes_fts, rowid, scene_description, tags, model_name, video_filename)
+                  VALUES('delete', old.id, old.scene_description, old.tags, old.model_name, old.video_filename);
+                  INSERT INTO scenes_fts(rowid, scene_description, tags, model_name, video_filename)
+                  VALUES (new.id, new.scene_description, new.tags, new.model_name, new.video_filename);
+                END;
+            """)
             conn.commit()
 
     def upsert_snapshot(self, record: Dict[str, Any], image_blob: Optional[bytes] = None) -> int:
@@ -854,8 +984,8 @@ class SnapshotDatabaseManager:
                     silhouette_type, areola_shape, eye_color, hair_color,
                     face_shape, nose_shape, ear_shape, estimated_height_cm,
                     hand_size_category, biometric_json, agy_verdict,
-                    agy_supervision, image_blob
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    agy_supervision, image_blob, status, review_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_filename) DO UPDATE SET
                     model_name=excluded.model_name,
                     image_path=excluded.image_path,
@@ -885,7 +1015,8 @@ class SnapshotDatabaseManager:
                     biometric_json=excluded.biometric_json,
                     agy_verdict=COALESCE(excluded.agy_verdict, snapshots.agy_verdict),
                     agy_supervision=COALESCE(excluded.agy_supervision, snapshots.agy_supervision),
-                    image_blob=COALESCE(excluded.image_blob, snapshots.image_blob);
+                    image_blob=COALESCE(excluded.image_blob, snapshots.image_blob),
+                    status=COALESCE(snapshots.status, excluded.status);
             """, (
                 record.get("model_name", "unknown"),
                 record.get("image_filename"),
@@ -916,10 +1047,164 @@ class SnapshotDatabaseManager:
                 json.dumps(record.get("biometrics", {})),
                 record.get("agy_verdict", "PENDING"),
                 record.get("agy_supervision", ""),
-                image_blob
+                image_blob,
+                record.get("status", "pending"),
+                record.get("review_note", "")
             ))
             conn.commit()
             return cursor.lastrowid
+
+    def set_status(self, snapshot_id: int, status: str, note: Optional[str] = None) -> bool:
+        """Sets review status: 'verified', 'rejected', or 'pending' with optional review note."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            if note is not None:
+                cursor.execute("UPDATE snapshots SET status=?, review_note=? WHERE id=?", (status, note, snapshot_id))
+            else:
+                cursor.execute("UPDATE snapshots SET status=? WHERE id=?", (status, snapshot_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def record_feedback(self, snapshot_id: int, model_name: str, zone_type: str, error_category: str, user_note: str) -> int:
+        """Records a human correction note for Antigravity (AGY) cognitive active learning."""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO agy_feedback_memory (snapshot_id, model_name, zone_type, error_category, user_note)
+                VALUES (?, ?, ?, ?, ?)
+            """, (snapshot_id, model_name, zone_type, error_category, user_note))
+            # Also update review_note and mark as rejected
+            cursor.execute("UPDATE snapshots SET status='rejected', review_note=? WHERE id=?", (f"[{error_category}] {user_note}".strip(), snapshot_id))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_feedback_memory(self, model_name: Optional[str] = None, zone_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = "SELECT * FROM agy_feedback_memory"
+            params = []
+            clauses = []
+            if model_name:
+                clauses.append("model_name=?")
+                params.append(model_name)
+            if zone_type:
+                clauses.append("zone_type=?")
+                params.append(zone_type)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY created_at DESC"
+            cursor.execute(query, tuple(params))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_models_summary(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT
+                    model_name,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status='verified' THEN 1 ELSE 0 END) as verified,
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) as rejected,
+                    SUM(CASE WHEN status='pending' OR status IS NULL THEN 1 ELSE 0 END) as pending
+                FROM snapshots
+                GROUP BY model_name
+                ORDER BY total DESC;
+            """)
+            rows = cursor.fetchall()
+            return [
+                {
+                    "model_name": r[0],
+                    "total": r[1],
+                    "verified": r[2] or 0,
+                    "rejected": r[3] or 0,
+                    "pending": r[4] or 0
+                }
+                for r in rows
+            ]
+
+    def get_snapshots_filtered(
+        self,
+        model_name: Optional[str] = None,
+        zone_type: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            clauses = []
+            params = []
+            if model_name:
+                clauses.append("model_name=?")
+                params.append(model_name)
+            if zone_type:
+                clauses.append("zone_type=?")
+                params.append(zone_type)
+            if status and status != "all":
+                if status == "pending":
+                    clauses.append("(status='pending' OR status IS NULL)")
+                else:
+                    clauses.append("status=?")
+                    params.append(status)
+
+            where_str = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+            # Count total
+            cursor.execute(f"SELECT COUNT(*) FROM snapshots{where_str}", tuple(params))
+            total = int(cursor.fetchone()[0])
+
+            # Select records (excluding large image_blob from table payload, accessed via /api/image/{id})
+            query = f"""
+                SELECT
+                    id, model_name, image_filename, image_path, zone_type,
+                    description, source_video, timestamp_sec, timestamp_str,
+                    studio_score, sharpness, brightness, contrast,
+                    skin_tone_hex, fitzpatrick_type, complexion_smoothness,
+                    silhouette_type, areola_shape, eye_color, hair_color,
+                    face_shape, nose_shape, ear_shape, estimated_height_cm,
+                    hand_size_category, agy_verdict, status, review_note,
+                    (image_blob IS NOT NULL) as has_blob,
+                    created_at
+                FROM snapshots
+                {where_str}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+            """
+            cursor.execute(query, tuple(params + [limit, offset]))
+            items = [dict(r) for r in cursor.fetchall()]
+            return items, total
+
+    def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            return res
+
+    def get_image_blob(self, snapshot_id: int) -> Optional[Tuple[bytes, str]]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT image_blob, image_filename, image_path FROM snapshots WHERE id=?", (snapshot_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            blob, fname, fpath = row[0], row[1], row[2]
+            if blob:
+                return blob, fname
+            # Fallback to local file if blob was not stored
+            if fpath and Path(fpath).is_file():
+                try:
+                    with open(fpath, "rb") as f:
+                        return f.read(), fname
+                except Exception:
+                    pass
+            return None
 
     def count(self, model_name: Optional[str] = None) -> int:
         with sqlite3.connect(str(self.db_path)) as conn:
@@ -938,6 +1223,155 @@ class SnapshotDatabaseManager:
                 cursor.execute("SELECT * FROM snapshots WHERE zone_type=? AND model_name=?", (zone_type, model_name))
             else:
                 cursor.execute("SELECT * FROM snapshots WHERE zone_type=?", (zone_type,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def upsert_scene(
+        self,
+        model_name: str,
+        video_filename: str,
+        video_path: str,
+        minute_index: int,
+        timestamp_sec: float,
+        timestamp_str: str,
+        scene_description: str,
+        tags: str = "",
+        studio_score: float = 0.0,
+        image_blob: Optional[bytes] = None
+    ) -> int:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO video_scenes (
+                    model_name, video_filename, video_path, minute_index,
+                    timestamp_sec, timestamp_str, scene_description, tags,
+                    studio_score, image_blob
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_filename, minute_index) DO UPDATE SET
+                    scene_description=excluded.scene_description,
+                    tags=excluded.tags,
+                    studio_score=excluded.studio_score,
+                    image_blob=COALESCE(excluded.image_blob, video_scenes.image_blob),
+                    timestamp_sec=excluded.timestamp_sec,
+                    timestamp_str=excluded.timestamp_str;
+            """, (
+                model_name, video_filename, video_path, minute_index,
+                timestamp_sec, timestamp_str, scene_description, tags,
+                studio_score, image_blob
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_video_scenes(self, video_filename: Optional[str] = None, model_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            clauses = []
+            params = []
+            if video_filename:
+                clauses.append("video_filename=?")
+                params.append(video_filename)
+            if model_name:
+                clauses.append("model_name=?")
+                params.append(model_name)
+            where_str = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor.execute(f"""
+                SELECT id, model_name, video_filename, video_path, minute_index,
+                       timestamp_sec, timestamp_str, scene_description, tags,
+                       studio_score, (image_blob IS NOT NULL) as has_blob, created_at
+                FROM video_scenes
+                {where_str}
+                ORDER BY minute_index ASC
+            """, tuple(params))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_scene_image_blob(self, scene_id: int) -> Optional[bytes]:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT image_blob FROM video_scenes WHERE id=?", (scene_id,))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+
+    def search_scenes(self, query: str, model_name: Optional[str] = None, limit: int = 25) -> List[Dict[str, Any]]:
+        import re
+        clean_q = query.strip()
+        if not clean_q:
+            return []
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # 1. Minute / Time parsing (e.g. "minuto 4", "4:30")
+            min_match = re.search(r'(?:minuto|min|m)\s*(\d+)', clean_q, re.IGNORECASE)
+            time_match = re.search(r'(\d+):(\d+)', clean_q)
+
+            if min_match:
+                target_min = int(min_match.group(1))
+                q_sql = "SELECT id, model_name, video_filename, video_path, minute_index, timestamp_sec, timestamp_str, scene_description, tags, studio_score FROM video_scenes WHERE minute_index=?"
+                params = [target_min]
+                if model_name and model_name != "all":
+                    q_sql += " AND model_name=?"
+                    params.append(model_name)
+                cursor.execute(q_sql, tuple(params))
+                rows = cursor.fetchall()
+                if rows:
+                    return [dict(r) for r in rows]
+
+            elif time_match:
+                t_sec = int(time_match.group(1)) * 60 + int(time_match.group(2))
+                q_sql = "SELECT id, model_name, video_filename, video_path, minute_index, timestamp_sec, timestamp_str, scene_description, tags, studio_score FROM video_scenes WHERE abs(timestamp_sec - ?) <= 60"
+                params = [t_sec]
+                if model_name and model_name != "all":
+                    q_sql += " AND model_name=?"
+                    params.append(model_name)
+                cursor.execute(q_sql, tuple(params))
+                rows = cursor.fetchall()
+                if rows:
+                    return [dict(r) for r in rows]
+
+            # 2. Full-Text Search (FTS5)
+            try:
+                fts_query = re.sub(r'[^\w\s]', ' ', clean_q).strip()
+                if fts_query:
+                    fts_terms = " OR ".join([f'"{term}"*' for term in fts_query.split()])
+                    q_sql = """
+                        SELECT v.id, v.model_name, v.video_filename, v.video_path,
+                               v.minute_index, v.timestamp_sec, v.timestamp_str,
+                               v.scene_description, v.tags, v.studio_score
+                        FROM scenes_fts f
+                        JOIN video_scenes v ON f.rowid = v.id
+                        WHERE scenes_fts MATCH ?
+                    """
+                    params = [fts_terms]
+                    if model_name and model_name != "all":
+                        q_sql += " AND v.model_name = ?"
+                        params.append(model_name)
+                    q_sql += " ORDER BY rank LIMIT ?"
+                    params.append(limit)
+
+                    cursor.execute(q_sql, tuple(params))
+                    rows = cursor.fetchall()
+                    if rows:
+                        return [dict(r) for r in rows]
+            except Exception:
+                pass
+
+            # 3. Fallback to LIKE substring search
+            like_sql = """
+                SELECT id, model_name, video_filename, video_path, minute_index,
+                       timestamp_sec, timestamp_str, scene_description, tags, studio_score
+                FROM video_scenes
+                WHERE (scene_description LIKE ? OR tags LIKE ? OR video_filename LIKE ?)
+            """
+            like_pattern = f"%{clean_q}%"
+            params = [like_pattern, like_pattern, like_pattern]
+            if model_name and model_name != "all":
+                like_sql += " AND model_name=?"
+                params.append(model_name)
+            like_sql += " ORDER BY studio_score DESC LIMIT ?"
+            params.append(limit)
+
+            cursor.execute(like_sql, tuple(params))
             return [dict(r) for r in cursor.fetchall()]
 
 
@@ -1024,58 +1458,552 @@ class AgySupervisor:
 
 
 class AnatomicalZoneExtractor:
-    """Extracts extended multi-region crops matching Francisco's anatomical vocabulary."""
+    """
+    Extracts complete, fine-grained multi-region crops with lateral independence (left/right)
+    matching Francisco's precise anatomical vocabulary:
+    - Craniofacial: cara, frente, cejas, ojos, nariz, boca, menton, oreja_izq, oreja_der, cabello
+    - Torso/Trunk: torso, espalda, breast, aerola_izq, aerola_der, ombligo, cadera
+    - Pelvis/Intimate: entrepierna, pompi
+    - Limbs (Upper): brazo_izq, brazo_der, mano_izq, mano_der
+    - Limbs (Lower): pierna_izq, pierna_der, muslo_izq, muslo_der, tobillo_izq, tobillo_der, pie_izq, pie_der
+    - Full: cuerpo
+    """
 
     @staticmethod
+    def crop_box(img: np.ndarray, x1: float, y1: float, x2: float, y2: float) -> Optional[np.ndarray]:
+        if img is None or img.size == 0:
+            return None
+        h, w = img.shape[:2]
+        ix1, iy1 = max(0, int(round(x1))), max(0, int(round(y1)))
+        ix2, iy2 = min(w, int(round(x2))), min(h, int(round(y2)))
+        if (ix2 - ix1) < 15 or (iy2 - iy1) < 15:
+            return None
+        return img[iy1:iy2, ix1:ix2].copy()
+
+    @classmethod
+    def isolate_areola(cls, breast_img: np.ndarray, is_left: bool) -> Optional[np.ndarray]:
+        """Isolates left or right areola independently via Lab/HSV pigmentation and contour analysis."""
+        if breast_img is None or breast_img.size == 0:
+            return None
+        bh, bw = breast_img.shape[:2]
+        if bh < 25 or bw < 40:
+            return None
+
+        # Split breast horizontally: left hemisphere vs right hemisphere
+        mid_x = bw // 2
+        hemi = breast_img[:, :mid_x] if is_left else breast_img[:, mid_x:]
+        hh, hw = hemi.shape[:2]
+        if hh < 20 or hw < 20:
+            return None
+
+        # Detect pigmentation contrast in CIE-Lab
+        lab = cv2.cvtColor(hemi, cv2.COLOR_BGR2LAB)
+        L = lab[:, :, 0]
+        a = lab[:, :, 1]
+        skin_L = np.median(L)
+        skin_a = np.median(a)
+
+        # Areola has darker L* and higher a* (redness/pink/brown) than surrounding skin
+        pigment_score = (skin_L - L.astype(float)) + 1.8 * (a.astype(float) - skin_a)
+        pigment_norm = cv2.normalize(pigment_score, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        _, thresh = cv2.threshold(pigment_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        target_cx = int(hw * 0.50)
+        target_cy = int(hh * 0.55)
+        best_cnt = None
+        max_prominence = -1.0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 15 <= area <= (hh * hw * 0.40):
+                bx, by, bw_cnt, bh_cnt = cv2.boundingRect(cnt)
+                aspect = max(bw_cnt, bh_cnt) / float(max(1, min(bw_cnt, bh_cnt)))
+                if aspect < 2.8:
+                    cx, cy = bx + bw_cnt // 2, by + bh_cnt // 2
+                    dist = math.hypot(cx - target_cx, cy - target_cy)
+                    prominence = area / (dist + 15.0)
+                    if prominence > max_prominence:
+                        max_prominence = prominence
+                        best_cnt = cnt
+
+        if best_cnt is not None:
+            (cx, cy), radius = cv2.minEnclosingCircle(best_cnt)
+            r = max(int(radius * 1.9), 30)
+            crop = cls.crop_box(hemi, cx - r, cy - r, cx + r, cy + r)
+            if crop is not None:
+                return crop
+
+        # Fallback: anatomical window around typical areola position (55% height, 50% width)
+        win_w = max(int(hw * 0.55), 35)
+        win_h = max(int(hh * 0.55), 35)
+        return cls.crop_box(hemi, target_cx - win_w // 2, target_cy - win_h // 2, target_cx + win_w // 2, target_cy + win_h // 2)
+
+    @classmethod
     def extract_all_zones(
+        cls,
         frame: np.ndarray,
-        rois_isolated: Dict[str, Any]
+        rois_isolated: Dict[str, Any],
+        kpts: Optional[np.ndarray] = None
     ) -> Dict[str, np.ndarray]:
         zones: Dict[str, np.ndarray] = {}
+        if frame is None or frame.size == 0:
+            return zones
 
-        # 1. Face -> 'cara'
-        if "face" in rois_isolated and rois_isolated["face"] is not None:
-            zones["cara"] = rois_isolated["face"]
+        # 0. Full body snapshot
+        zones["cuerpo"] = frame.copy()
 
-        # 2. Torso -> 'torso'
-        if "torso" in rois_isolated and rois_isolated["torso"] is not None:
-            t_img = rois_isolated["torso"]
-            zones["torso"] = t_img
-            th, tw = t_img.shape[:2]
+        # ==========================================
+        # 1. CRANEOFACIAL (cara, frente, cejas, ojos, nariz, boca, menton, oreja_izq, oreja_der, cabello)
+        # ==========================================
+        face_img = rois_isolated.get("face") if rois_isolated else None
+        if face_img is not None and face_img.size > 0:
+            zones["cara"] = face_img
+            fh, fw = face_img.shape[:2]
 
-            # 3. Breasts -> Upper 55% of torso
+            # 1.1 Frente de la cara (Forehead: tercio superior frontal sobre cejas)
+            frente = cls.crop_box(face_img, fw * 0.12, 0, fw * 0.88, fh * 0.36)
+            if frente is not None:
+                zones["frente"] = frente
+
+            # 1.2 Cejas
+            cejas = cls.crop_box(face_img, fw * 0.08, fh * 0.18, fw * 0.92, fh * 0.38)
+            if cejas is not None:
+                zones["cejas"] = cejas
+
+            # 1.3 Ojos (franja ocular binocular)
+            ojos = cls.crop_box(face_img, fw * 0.08, fh * 0.26, fw * 0.92, fh * 0.50)
+            if ojos is not None:
+                zones["ojos"] = ojos
+
+            # 1.4 Nariz (tercio medio nasal)
+            nariz = cls.crop_box(face_img, fw * 0.28, fh * 0.38, fw * 0.72, fh * 0.68)
+            if nariz is not None:
+                zones["nariz"] = nariz
+
+            # 1.5 Boca (labios y comisuras)
+            boca = cls.crop_box(face_img, fw * 0.20, fh * 0.64, fw * 0.80, fh * 0.86)
+            if boca is not None:
+                zones["boca"] = boca
+
+            # 1.6 Mentón / Barbilla
+            menton = cls.crop_box(face_img, fw * 0.24, fh * 0.78, fw * 0.76, fh)
+            if menton is not None:
+                zones["menton"] = menton
+
+            # 1.7 Orejas (oreja_izq y oreja_der en bordes laterales de la cara)
+            oreja_izq = cls.crop_box(face_img, 0, fh * 0.25, fw * 0.22, fh * 0.70)
+            if oreja_izq is not None:
+                zones["oreja_izq"] = oreja_izq
+
+            oreja_der = cls.crop_box(face_img, fw * 0.78, fh * 0.25, fw, fh * 0.70)
+            if oreja_der is not None:
+                zones["oreja_der"] = oreja_der
+
+            # 1.8 Cabello (coronilla y cabellera parietal)
+            cabello = cls.crop_box(face_img, 0, 0, fw, fh * 0.28)
+            if cabello is not None:
+                zones["cabello"] = cabello
+
+        # ==========================================
+        # 2. TORSO, BUSTO, ESPALDA, OMBLIGO, CADERA
+        # ==========================================
+        torso_img = rois_isolated.get("torso") if rois_isolated else None
+        if torso_img is not None and torso_img.size > 0:
+            zones["torso"] = torso_img
+            th, tw = torso_img.shape[:2]
+
+            # 2.1 Busto / Breast (mitad superior del torso)
             if th >= 40 and tw >= 40:
-                breast_img = t_img[:int(th * 0.55), :]
+                breast_img = torso_img[:int(th * 0.55), :]
                 zones["breast"] = breast_img
 
-                # 4. Aerola -> Left/Right breast centers
-                bh, bw = breast_img.shape[:2]
-                if bh >= 25 and bw >= 50:
-                    left_aerola = breast_img[int(bh * 0.3):int(bh * 0.8), int(bw * 0.15):int(bw * 0.45)]
-                    if left_aerola.size > 0:
-                        zones["aerola"] = left_aerola
+                # 2.2 Areolas independientes (izquierda y derecha por asimetría)
+                aerola_izq = cls.isolate_areola(breast_img, is_left=True)
+                if aerola_izq is not None:
+                    zones["aerola_izq"] = aerola_izq
 
-        # 5. Hips / Glutes -> 'pompi' (rear/contour) AND 'frente' (front/pelvis)
-        if "hips_glutes" in rois_isolated and rois_isolated["hips_glutes"] is not None:
-            hg_img = rois_isolated["hips_glutes"]
+                aerola_der = cls.isolate_areola(breast_img, is_left=False)
+                if aerola_der is not None:
+                    zones["aerola_der"] = aerola_der
+
+            # 2.3 Ombligo (vientre medio, franja 65%-88% del torso)
+            if th >= 50 and tw >= 40:
+                ombligo = cls.crop_box(torso_img, tw * 0.32, th * 0.65, tw * 0.68, th * 0.88)
+                if ombligo is not None:
+                    zones["ombligo"] = ombligo
+
+            # 2.4 Cadera (crestas ilíacas y laterales del tronco inferior)
+            if th >= 50 and tw >= 40:
+                cadera = cls.crop_box(torso_img, 0, th * 0.72, tw, th)
+                if cadera is not None:
+                    zones["cadera"] = cadera
+
+            # 2.5 Espalda (dorso posterior)
+            espalda = cls.crop_box(torso_img, tw * 0.15, th * 0.10, tw * 0.85, th * 0.70)
+            if espalda is not None:
+                zones["espalda"] = espalda
+
+        # ==========================================
+        # 3. PELVIS, ENTREPIERNA Y GLÚTEOS
+        # ==========================================
+        hg_img = rois_isolated.get("hips_glutes") if rois_isolated else None
+        if hg_img is not None and hg_img.size > 0:
             zones["pompi"] = hg_img
             hgh, hgw = hg_img.shape[:2]
 
-            # Isolate front pelvic region: central lower abdomen / anterior pubic area
-            if hgh >= 40 and hgw >= 40:
-                frente_crop = hg_img[:int(hgh * 0.75), int(hgw * 0.20):int(hgw * 0.80)]
-                if frente_crop.size > 0:
-                    zones["frente"] = frente_crop
+            # 3.1 Entrepierna (Ingle / Crotch / cara medial proximal de muslos)
+            entrepierna = cls.crop_box(hg_img, hgw * 0.28, hgh * 0.25, hgw * 0.72, hgh * 0.80)
+            if entrepierna is not None:
+                zones["entrepierna"] = entrepierna
 
-        # 6. Lower limbs -> 'piernas'
-        if "legs" in rois_isolated and rois_isolated["legs"] is not None:
-            zones["piernas"] = rois_isolated["legs"]
+        # ==========================================
+        # 4. EXTREMIDADES GUIADAS POR KEYPOINTS COCO-17
+        # ==========================================
+        if kpts is not None and len(kpts) >= 17:
+            # 4.1 Brazo Izquierdo (hombro 5, codo 7, muñeca 9)
+            arm_l = [kpts[i] for i in [5, 7, 9] if kpts[i][2] > 0.20]
+            if len(arm_l) >= 2:
+                xs, ys = [p[0] for p in arm_l], [p[1] for p in arm_l]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 25.0) * 0.22
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+                if crop is not None:
+                    zones["brazo_izq"] = crop
 
-        # 7. Arms -> 'brazos'
-        if "arms" in rois_isolated and rois_isolated["arms"] is not None:
-            zones["brazos"] = rois_isolated["arms"]
+            # 4.2 Brazo Derecho (hombro 6, codo 8, muñeca 10)
+            arm_r = [kpts[i] for i in [6, 8, 10] if kpts[i][2] > 0.20]
+            if len(arm_r) >= 2:
+                xs, ys = [p[0] for p in arm_r], [p[1] for p in arm_r]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 25.0) * 0.22
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+                if crop is not None:
+                    zones["brazo_der"] = crop
+
+            # 4.3 Manos (mano_izq en muñeca 9, mano_der en muñeca 10)
+            if kpts[9][2] > 0.25:
+                mx, my = kpts[9][0], kpts[9][1]
+                mr = 45.0
+                crop = cls.crop_box(frame, mx - mr, my - mr, mx + mr, my + mr)
+                if crop is not None:
+                    zones["mano_izq"] = crop
+
+            if kpts[10][2] > 0.25:
+                mx, my = kpts[10][0], kpts[10][1]
+                mr = 45.0
+                crop = cls.crop_box(frame, mx - mr, my - mr, mx + mr, my + mr)
+                if crop is not None:
+                    zones["mano_der"] = crop
+
+            # 4.4 Pierna Izquierda (cadera 11, rodilla 13, tobillo 15)
+            leg_l = [kpts[i] for i in [11, 13, 15] if kpts[i][2] > 0.20]
+            if len(leg_l) >= 2:
+                xs, ys = [p[0] for p in leg_l], [p[1] for p in leg_l]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.18
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+                if crop is not None:
+                    zones["pierna_izq"] = crop
+
+            # 4.5 Pierna Derecha (cadera 12, rodilla 14, tobillo 16)
+            leg_r = [kpts[i] for i in [12, 14, 16] if kpts[i][2] > 0.20]
+            if len(leg_r) >= 2:
+                xs, ys = [p[0] for p in leg_r], [p[1] for p in leg_r]
+                pad = max(max(xs) - min(xs), max(ys) - min(ys), 30.0) * 0.18
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+                if crop is not None:
+                    zones["pierna_der"] = crop
+
+            # 4.6 Muslos (muslo_izq entre cadera 11 y rodilla 13, muslo_der entre cadera 12 y rodilla 14)
+            if kpts[11][2] > 0.20 and kpts[13][2] > 0.20:
+                xs = [kpts[11][0], kpts[13][0]]
+                ys = [kpts[11][1], kpts[13][1]]
+                pad = max(abs(xs[1] - xs[0]), 30.0) * 0.35
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - 10, max(xs) + pad, max(ys) + 15)
+                if crop is not None:
+                    zones["muslo_izq"] = crop
+
+            if kpts[12][2] > 0.20 and kpts[14][2] > 0.20:
+                xs = [kpts[12][0], kpts[14][0]]
+                ys = [kpts[12][1], kpts[14][1]]
+                pad = max(abs(xs[1] - xs[0]), 30.0) * 0.35
+                crop = cls.crop_box(frame, min(xs) - pad, min(ys) - 10, max(xs) + pad, max(ys) + 15)
+                if crop is not None:
+                    zones["muslo_der"] = crop
+
+            # 4.7 Tobillos (tobillo_izq en 15, tobillo_der en 16)
+            if kpts[15][2] > 0.25:
+                tx, ty = kpts[15][0], kpts[15][1]
+                tr = 40.0
+                crop = cls.crop_box(frame, tx - tr, ty - tr, tx + tr, ty + tr)
+                if crop is not None:
+                    zones["tobillo_izq"] = crop
+
+            if kpts[16][2] > 0.25:
+                tx, ty = kpts[16][0], kpts[16][1]
+                tr = 40.0
+                crop = cls.crop_box(frame, tx - tr, ty - tr, tx + tr, ty + tr)
+                if crop is not None:
+                    zones["tobillo_der"] = crop
+
+            # 4.8 Pies (pie_izq y pie_der desde el tobillo hacia abajo)
+            if kpts[15][2] > 0.20:
+                tx, ty = kpts[15][0], kpts[15][1]
+                crop = cls.crop_box(frame, tx - 45, ty - 15, tx + 45, ty + 65)
+                if crop is not None:
+                    zones["pie_izq"] = crop
+
+            if kpts[16][2] > 0.20:
+                tx, ty = kpts[16][0], kpts[16][1]
+                crop = cls.crop_box(frame, tx - 45, ty - 15, tx + 45, ty + 65)
+                if crop is not None:
+                    zones["pie_der"] = crop
 
         return zones
+
+
+class GoogleDriveSource:
+    """Discovers, queries, and stages media from configured Google Drive accounts via rclone."""
+
+    DEFAULT_REMOTES = ["gdrive", "gdrive_phone", "gdrive_broker", "gdrive_eng", "gdrive_fdev"]
+    CACHE_DIR = Path.home() / ".cache" / "video_snapshot_harvester" / "gdrive_staging"
+
+    @classmethod
+    def get_configured_remotes(cls) -> List[str]:
+        try:
+            res = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, check=True)
+            remotes = [line.strip().rstrip(":") for line in res.stdout.splitlines() if line.strip()]
+            return remotes if remotes else cls.DEFAULT_REMOTES
+        except Exception:
+            return cls.DEFAULT_REMOTES
+
+    @classmethod
+    def _model_aliases(cls, model_name: str) -> List[str]:
+        clean = model_name.strip().lower()
+        aliases = [clean]
+        if clean == "uwxo":
+            aliases.append("uwuxo")
+        elif clean == "uwuxo":
+            aliases.append("uwxo")
+        elif clean == "tanni_bc":
+            aliases.append("taanni_bc")
+        elif clean == "taanni_bc":
+            aliases.append("tanni_bc")
+        elif clean.endswith("_") and not clean.endswith("__"):
+            aliases.append(clean + "_")
+        elif clean.endswith("__"):
+            aliases.append(clean[:-1])
+        return list(dict.fromkeys(aliases))
+
+    @classmethod
+    def search_model_media(
+        cls,
+        model_name: str,
+        remotes: Optional[List[str]] = None,
+        base_folder: str = "Recurbate",
+        media_type: str = "all",
+        max_files: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Scans remote Google Drive accounts for media files matching model_name.
+        Returns list of file descriptors.
+        """
+        if remotes is None:
+            configured = cls.get_configured_remotes()
+            remotes = configured if configured else cls.DEFAULT_REMOTES
+
+        video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts"}
+        photo_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+        if media_type == "videos":
+            target_exts = video_exts
+        elif media_type == "photos":
+            target_exts = photo_exts
+        else:
+            target_exts = video_exts | photo_exts
+
+        aliases = cls._model_aliases(model_name)
+        discovered: List[Dict[str, Any]] = []
+
+        for remote in remotes:
+            if len(discovered) >= max_files:
+                break
+            for alias in aliases:
+                if len(discovered) >= max_files:
+                    break
+                candidate_paths = [f"{base_folder}/{alias}" if base_folder else alias, alias]
+                for c_path in candidate_paths:
+                    remote_target = f"{remote}:{c_path}"
+                    cmd = ["rclone", "lsjson", remote_target, "--max-depth", "1"]
+                    try:
+                        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                        if res.returncode != 0 or not res.stdout.strip():
+                            continue
+                        items = json.loads(res.stdout)
+                        for item in items:
+                            if item.get("IsDir"):
+                                continue
+                            fname = item.get("Name", "")
+                            ext = Path(fname).suffix.lower()
+                            if ext in target_exts:
+                                discovered.append({
+                                    "remote": remote,
+                                    "remote_target": remote_target,
+                                    "remote_path": f"{remote_target}/{fname}",
+                                    "filename": fname,
+                                    "size": item.get("Size", 0),
+                                    "mod_time": item.get("ModTime", ""),
+                                    "is_video": ext in video_exts,
+                                    "model": model_name
+                                })
+                                if len(discovered) >= max_files:
+                                    break
+                    except Exception:
+                        continue
+
+        return discovered
+
+    @classmethod
+    def stage_file(cls, remote_path: str, cache_dir: Optional[Path] = None) -> Optional[Path]:
+        """
+        Downloads the remote file using rclone to a local staging directory.
+        Uses cached local file if size matches.
+        """
+        staging_dir = cache_dir or cls.CACHE_DIR
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        parts = remote_path.split(":", 1)
+        if len(parts) != 2:
+            return None
+        remote_name, rel_path = parts
+        filename = Path(rel_path).name
+
+        local_path = staging_dir / remote_name / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if local_path.is_file() and local_path.stat().st_size > 0:
+            return local_path
+
+        print(f"  ☁️ Descargando desde Google Drive ({remote_name}): {filename}...")
+        cmd = ["rclone", "copyto", remote_path, str(local_path)]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if res.returncode == 0 and local_path.is_file():
+                mb = local_path.stat().st_size / (1024 * 1024)
+                print(f"  ✅ Descargado en staging: {local_path.name} ({mb:.1f} MB)")
+                return local_path
+            else:
+                print(f"  ⚠️ Error en rclone copyto: {res.stderr}")
+                return None
+        except Exception as e:
+            print(f"  ⚠️ Excepción descargando {remote_path}: {e}")
+            return None
+
+    @classmethod
+    def clean_staging(cls, staged_files: List[Path]):
+        for p in staged_files:
+            try:
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+class SocialMediaSource:
+    """Downloads reels, clips, and photos from social media (Instagram, TikTok, X, Reddit, etc.) via yt-dlp."""
+
+    CACHE_DIR = Path.home() / ".cache" / "video_snapshot_harvester" / "social_staging"
+
+    @classmethod
+    def is_social_url(cls, url: str) -> bool:
+        if not isinstance(url, str):
+            return False
+        clean = url.strip().lower()
+        if not (clean.startswith("http://") or clean.startswith("https://")):
+            return False
+        known_domains = [
+            "instagram.com", "tiktok.com", "twitter.com", "x.com", "reddit.com",
+            "youtube.com", "youtu.be", "fansly.com", "facebook.com", "pin.it", "pinterest.com"
+        ]
+        return any(d in clean for d in known_domains)
+
+    @classmethod
+    def download_url(cls, url: str, cache_dir: Optional[Path] = None) -> Optional[Path]:
+        staging_dir = cache_dir or cls.CACHE_DIR
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        output_template = str(staging_dir / f"social_{url_hash}_%(id)s.%(ext)s")
+
+        print(f"  🌐 Descargando reel/video de red social vía yt-dlp: {url}...")
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", output_template,
+            url
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0:
+                candidates = list(staging_dir.glob(f"social_{url_hash}_*"))
+                if candidates:
+                    target = candidates[0]
+                    mb = target.stat().st_size / (1024 * 1024)
+                    print(f"  ✅ Descarga social lista: {target.name} ({mb:.1f} MB)")
+                    return target
+            print(f"  ⚠️ Error en yt-dlp: {res.stderr[:200]}")
+            return None
+        except Exception as e:
+            print(f"  ⚠️ Excepción descargando URL social {url}: {e}")
+            return None
+
+    @classmethod
+    def clean_staging(cls, staged_files: List[Path]):
+        for p in staged_files:
+            try:
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+class CatalogSource:
+    """Discovers photos and videos from existing local model datasets and catalogs."""
+
+    DATASET_ROOTS = [
+        Path.home() / "ComputerVision" / "datasets",
+        Path.home() / "Videos" / "Recurbate",
+        Path("/media/fbetancourt/ADATA HD710 PRO1")
+    ]
+
+    @classmethod
+    def find_media(cls, model_name: str, media_type: str = "all", max_files: int = 20) -> List[Path]:
+        discovered = []
+        aliases = GoogleDriveSource._model_aliases(model_name)
+        video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts"}
+        photo_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+        if media_type == "videos":
+            target_exts = video_exts
+        elif media_type == "photos":
+            target_exts = photo_exts
+        else:
+            target_exts = video_exts | photo_exts
+
+        for root in cls.DATASET_ROOTS:
+            if not root.exists():
+                continue
+            for alias in aliases:
+                cand = root / alias
+                if cand.is_dir():
+                    for item in cand.rglob("*"):
+                        if item.is_file() and item.suffix.lower() in target_exts:
+                            discovered.append(item)
+                            if len(discovered) >= max_files:
+                                return discovered
+        return discovered
 
 
 class HarvestConfig:
@@ -1097,7 +2025,14 @@ class HarvestConfig:
         enable_db: bool = False,
         db_path: Optional[str] = None,
         store_blob: bool = False,
-        supervise_agy: bool = False
+        supervise_agy: bool = False,
+        origin: str = "auto",
+        gdrive_remote: str = "all",
+        gdrive_folder: str = "Recurbate",
+        media_type: str = "all",
+        max_videos: int = 5,
+        situations_per_video: int = 4,
+        clean_staging: bool = False
     ):
         self.mode = mode
         self.interval_sec = interval_sec
@@ -1116,6 +2051,13 @@ class HarvestConfig:
         self.db_path = db_path
         self.store_blob = store_blob
         self.supervise_agy = supervise_agy
+        self.origin = origin
+        self.gdrive_remote = gdrive_remote
+        self.gdrive_folder = gdrive_folder
+        self.media_type = media_type
+        self.max_videos = max_videos
+        self.situations_per_video = situations_per_video
+        self.clean_staging = clean_staging
 
 
 class VideoSnapshotHarvester:
@@ -1146,7 +2088,7 @@ class VideoSnapshotHarvester:
         supervise_agy: bool = False,
         verbose: bool = False
     ):
-        self.output_dir = output_dir.resolve()
+        self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.mode = mode
         self.min_sharpness = min_sharpness
@@ -1196,7 +2138,8 @@ class VideoSnapshotHarvester:
         source_vid_path: Path,
         timestamp_sec: float,
         metrics: Dict[str, Any],
-        rois_isolated: Dict[str, Any]
+        rois_isolated: Dict[str, Any],
+        kpts: Optional[np.ndarray] = None
     ) -> List[Dict[str, Any]]:
         now_iso = datetime.now(timezone.utc).isoformat()
         records: List[Dict[str, Any]] = []
@@ -1276,13 +2219,13 @@ class VideoSnapshotHarvester:
                     img_blob = f.read()
             self.db_manager.upsert_snapshot(main_record, image_blob=img_blob)
 
-        # 3. Extended Multi-Zone Crops ('cara', 'breast', 'pompi', 'frente', 'aerola', 'piernas', 'brazos', 'torso')
-        if self.crop_regions and rois_isolated:
-            zones_extracted = AnatomicalZoneExtractor.extract_all_zones(frame, rois_isolated)
+        # 3. Extended Multi-Zone Anatomical Crops (28 granular regions)
+        if self.crop_regions:
+            zones_extracted = AnatomicalZoneExtractor.extract_all_zones(frame, rois_isolated, kpts=kpts)
             crops_dir = self.output_dir / "crops"
 
             for z_name, z_img in zones_extracted.items():
-                if z_img is None or z_img.size == 0:
+                if z_img is None or z_img.size == 0 or z_name == "cuerpo":
                     continue
 
                 z_sub_dir = crops_dir / z_name
@@ -1296,9 +2239,11 @@ class VideoSnapshotHarvester:
                 os.replace(crop_tmp, crop_dest)
                 DesktopThumbnailManager.sync_thumbnail(crop_dest)
 
-                crop_skin = SkinToneAnalyzer.analyze_skin(z_img) if z_name in ("cara", "torso", "breast", "pompi", "frente") else skin_info
-                areola_info = AreolaMorphologyAnalyzer.analyze_areola(z_img) if z_name in ("aerola", "breast") else None
-                crop_face = FacialMorphologyAnalyzer.analyze_face(z_img) if z_name == "cara" else face_info
+                crop_skin = SkinToneAnalyzer.analyze_skin(z_img) if z_name in (
+                    "cara", "torso", "breast", "pompi", "frente", "espalda", "ombligo", "muslo_izq", "muslo_der", "pierna_izq", "pierna_der"
+                ) else skin_info
+                areola_info = AreolaMorphologyAnalyzer.analyze_areola(z_img) if ("aerola" in z_name or z_name == "breast") else None
+                crop_face = FacialMorphologyAnalyzer.analyze_face(z_img) if z_name in ("cara", "ojos", "frente", "nariz") else face_info
 
                 crop_desc = generate_snapshot_description(
                     model_name=self.target_model,
@@ -1388,9 +2333,11 @@ class VideoSnapshotHarvester:
                 st_info = StudioQualityScorer.score_frame(frame, min_sharpness=self.min_sharpness)
 
                 rois_isolated = {}
+                kpts = None
                 if self.crop_regions and self.somatotype_extractor:
                     rois_data = self.somatotype_extractor.extract_keypoint_rois(frame)
                     rois_isolated = rois_data.get("rois", {})
+                    kpts = rois_data.get("kpts", None)
 
                 metrics = {
                     "studio_score": st_info["studio_score"],
@@ -1399,7 +2346,7 @@ class VideoSnapshotHarvester:
                     "contrast": st_info.get("contrast", 0.0)
                 }
 
-                saved = self._save_snapshot_and_records(frame, stem, vid_path, t_sec, metrics, rois_isolated)
+                saved = self._save_snapshot_and_records(frame, stem, vid_path, t_sec, metrics, rois_isolated, kpts=kpts)
                 all_records.extend(saved)
         finally:
             cap.release()
@@ -1413,6 +2360,92 @@ class VideoSnapshotHarvester:
                     self.db_manager.upsert_snapshot(rec)
 
         return self._write_catalogs(vid_path, all_records)
+
+    def harvest_minute_timeline(
+        self,
+        video_input: Union[Path, str],
+        model_name: Optional[str] = None,
+        interval_sec: float = 60.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Extracts 1 peak snapshot per minute across the entire video, generates a dense
+        scene context description, and saves it to video_scenes table with FTS5 indexing.
+        """
+        vid_path = Path(video_input).resolve()
+        target_model = model_name or self.target_model
+        info = VideoMetadataExtractor.get_info(vid_path)
+        duration = info.get("duration", 0.0)
+        if duration <= 0:
+            duration = 600.0
+
+        cap = cv2.VideoCapture(str(vid_path))
+        if not cap.isOpened():
+            return []
+
+        scenes_saved = []
+        minutes_total = int(duration // interval_sec) + (1 if (duration % interval_sec) > 5 else 0)
+
+        try:
+            for m_idx in range(minutes_total):
+                target_sec = m_idx * interval_sec
+                best_f = None
+                best_score = -1.0
+                best_ts = target_sec
+
+                # Sample 4 frames in a 4-second window to find the clearest moment
+                for offset_s in [0.0, 1.0, 2.0, 3.0]:
+                    s_sec = min(duration - 0.5, target_sec + offset_s)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, s_sec * 1000.0)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        continue
+                    sc_info = StudioQualityScorer.score_frame(frame, min_sharpness=self.min_sharpness)
+                    if sc_info["studio_score"] > best_score:
+                        best_score = sc_info["studio_score"]
+                        best_f = frame
+                        best_ts = s_sec
+
+                if best_f is None:
+                    continue
+
+                skin = SkinToneAnalyzer.analyze_skin(best_f)
+                h, w = best_f.shape[:2]
+                plan_type = "Plano General" if h > w else "Plano Medio"
+                time_str = f"{int(best_ts // 60):02d}m{int(best_ts % 60):02d}s"
+
+                desc = f"Escena minuto {m_idx} ({time_str}). {plan_type}. Tono de piel {skin.get('tone_label')} ({skin.get('fitzpatrick_type')}). Nitidez {best_score:.1f}. Contexto visual de {target_model}."
+                tags = f"{target_model}, minuto_{m_idx}, {skin.get('fitzpatrick_type')}, {plan_type.lower()}"
+
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                _, enc_bytes = cv2.imencode(".jpg", best_f, encode_param)
+                blob = enc_bytes.tobytes()
+
+                if self.db_manager:
+                    scene_id = self.db_manager.upsert_scene(
+                        model_name=target_model,
+                        video_filename=vid_path.name,
+                        video_path=str(vid_path),
+                        minute_index=m_idx,
+                        timestamp_sec=best_ts,
+                        timestamp_str=time_str,
+                        scene_description=desc,
+                        tags=tags,
+                        studio_score=best_score,
+                        image_blob=blob
+                    )
+                    scenes_saved.append({
+                        "id": scene_id,
+                        "minute_index": m_idx,
+                        "timestamp_sec": best_ts,
+                        "timestamp_str": time_str,
+                        "scene_description": desc,
+                        "tags": tags,
+                        "studio_score": best_score
+                    })
+        finally:
+            cap.release()
+
+        return scenes_saved
 
     def harvest_studio_situations(
         self,
@@ -1443,7 +2476,8 @@ class VideoSnapshotHarvester:
             for s_idx in range(num_situations):
                 w_start = t_start + (s_idx * window_duration)
                 w_end = min(t_end, w_start + window_duration)
-                sample_times = np.linspace(w_start, w_end, num=max(4, int(window_duration * 1.5)))
+                num_samples = min(10, max(4, int(window_duration * 0.2)))
+                sample_times = np.linspace(w_start, w_end, num=num_samples)
 
                 best_frame = None
                 best_sec = w_start
@@ -1490,9 +2524,11 @@ class VideoSnapshotHarvester:
                     is_dup, dist = self.dedup.is_duplicate(best_frame)
                     if not is_dup:
                         rois_isolated = {}
+                        kpts = None
                         if self.crop_regions and self.somatotype_extractor:
                             r_data = self.somatotype_extractor.extract_keypoint_rois(best_frame)
                             rois_isolated = r_data.get("rois", {})
+                            kpts = r_data.get("kpts", None)
 
                         metrics = {
                             "studio_score": best_score,
@@ -1501,7 +2537,7 @@ class VideoSnapshotHarvester:
                             "contrast": best_meta.get("contrast", 0.0)
                         }
 
-                        saved = self._save_snapshot_and_records(best_frame, stem, vid_path, best_sec, metrics, rois_isolated)
+                        saved = self._save_snapshot_and_records(best_frame, stem, vid_path, best_sec, metrics, rois_isolated, kpts=kpts)
                         all_records.extend(saved)
                         preview_frames_for_sheet.append((best_frame, saved[0]))
 
@@ -1547,6 +2583,40 @@ class VideoSnapshotHarvester:
         sheet_path = self.output_dir / f"{stem}_STUDIO_CONTACT_SHEET.jpg"
         cv2.imwrite(str(sheet_path), sheet, [cv2.IMWRITE_JPEG_QUALITY, 92])
         DesktopThumbnailManager.sync_thumbnail(sheet_path)
+
+    def _write_catalogs(self, primary_src: Union[Path, str], all_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        primary_path = Path(primary_src)
+        meta_path = self.output_dir / "SNAPSHOTS_METADATA.json"
+
+        clean_records = []
+        for r in all_records:
+            clean_rec = {k: v for k, v in r.items() if k != "image_blob"}
+            clean_records.append(clean_rec)
+
+        catalog_data = {
+            "version": "2.0.0",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source_video": primary_path.name,
+            "source_path": str(primary_path),
+            "target_model": self.target_model,
+            "total_records": len(all_records),
+            "records": clean_records
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(catalog_data, f, indent=2, ensure_ascii=False)
+
+        manifest = {
+            "source_video": str(primary_path),
+            "target_model": self.target_model,
+            "output_dir": str(self.output_dir),
+            "total_records": len(all_records),
+            "metadata_json": str(meta_path),
+            "records": clean_records
+        }
+        if self.db_manager:
+            manifest["sqlite_db"] = str(self.db_manager.db_path)
+
+        return manifest
 
     def harvest_from_video(
         self,
@@ -1612,6 +2682,7 @@ class VideoSnapshotHarvester:
                 face_conf = 0.0
                 person_conf = 0.0
                 rois_isolated = {}
+                kpts = None
 
                 if self.somatotype_extractor:
                     r_data = self.somatotype_extractor.extract_keypoint_rois(frame)
@@ -1620,6 +2691,7 @@ class VideoSnapshotHarvester:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, curr_frame)
                         continue
                     rois_isolated = r_data.get("rois", {})
+                    kpts = r_data.get("kpts", None)
                     person_conf = 0.9
 
                 if self.bio_engine:
@@ -1646,7 +2718,7 @@ class VideoSnapshotHarvester:
                     "contrast": st_info.get("contrast", 0.0)
                 }
 
-                saved = self._save_snapshot_and_records(frame, stem, vid_path, curr_sec, metrics, rois_isolated)
+                saved = self._save_snapshot_and_records(frame, stem, vid_path, curr_sec, metrics, rois_isolated, kpts=kpts)
                 all_records.extend(saved)
                 preview_frames.append((frame.copy(), saved[0]))
 
@@ -1668,38 +2740,115 @@ class VideoSnapshotHarvester:
 
         return self._write_catalogs(vid_path, all_records)
 
-    def _write_catalogs(self, vid_path: Path, all_records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        now_iso = datetime.now(timezone.utc).isoformat()
+    def harvest_from_image(self, image_input: Union[Path, str]) -> List[Dict[str, Any]]:
+        img_path = Path(image_input).resolve()
+        img = cv2.imread(str(img_path))
+        if img is None or img.size == 0:
+            return []
 
-        meta_file = self.output_dir / "SNAPSHOTS_METADATA.json"
-        meta_data = {
-            "model_name": self.target_model,
-            "source_video": vid_path.name,
-            "source_video_path": str(vid_path),
-            "catalog_date": now_iso,
-            "database_enabled": self.enable_db,
-            "database_path": str(self.db_manager.db_path) if self.db_manager else None,
-            "agy_supervision_enabled": self.supervise_agy,
-            "total_records": len(all_records),
-            "zones_summary": {z: sum(1 for r in all_records if r["zone_type"] == z) for z in ANATOMICAL_ZONES},
-            "records": all_records
+        stem = img_path.stem
+        valid_sharp, sharpness, brightness, _ = SharpnessAssessor.evaluate(img, min_variance=self.min_sharpness)
+        st_info = StudioQualityScorer.score_frame(img, min_sharpness=self.min_sharpness)
+
+        is_dup, dist = self.dedup.is_duplicate(img)
+        if is_dup:
+            return []
+
+        rois_isolated = {}
+        kpts = None
+        if self.crop_regions and self.somatotype_extractor:
+            r_data = self.somatotype_extractor.extract_keypoint_rois(img)
+            rois_isolated = r_data.get("rois", {})
+            kpts = r_data.get("kpts", None)
+
+        metrics = {
+            "studio_score": st_info.get("studio_score", 65.0),
+            "sharpness": sharpness,
+            "brightness": brightness,
+            "contrast": st_info.get("contrast", 0.0)
         }
-        with open(meta_file, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
 
-        manifest_file = self.output_dir / "SNAPSHOTS_MANIFEST.json"
-        manifest_data = {
-            "source_video": str(vid_path),
-            "video_filename": vid_path.name,
-            "target_model": self.target_model,
-            "generated_at": time.time(),
-            "total_saved": len(all_records),
-            "snapshots": all_records
-        }
-        with open(manifest_file, "w", encoding="utf-8") as f:
-            json.dump(manifest_data, f, indent=2)
+        saved = self._save_snapshot_and_records(img, stem, img_path, 0.0, metrics, rois_isolated, kpts=kpts)
+        return saved
 
-        return meta_data
+    def harvest_multi_source(
+        self,
+        sources: List[Union[Path, str]],
+        media_type: str = "all",
+        max_videos: Optional[int] = None,
+        situations_per_video: int = 4,
+        recursive: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Discovers and harvests studio snapshots and photos across multiple videos and image files/folders.
+        """
+        video_exts = {".mp4", ".mkv", ".ts", ".webm", ".avi", ".mov", ".flv", ".m4v"}
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+        discovered_videos: List[Path] = []
+        discovered_images: List[Path] = []
+
+        for src in sources:
+            p = Path(os.path.expanduser(str(src))).resolve()
+            if p.is_file():
+                ext = p.suffix.lower()
+                if ext in video_exts and media_type in ("all", "videos"):
+                    discovered_videos.append(p)
+                elif ext in image_exts and media_type in ("all", "photos"):
+                    discovered_images.append(p)
+            elif p.is_dir():
+                pattern_vids = p.rglob("*") if recursive else p.glob("*")
+                for item in pattern_vids:
+                    if item.is_file():
+                        ext = item.suffix.lower()
+                        if ext in video_exts and media_type in ("all", "videos"):
+                            discovered_videos.append(item)
+                        elif ext in image_exts and media_type in ("all", "photos"):
+                            discovered_images.append(item)
+
+        discovered_videos = sorted(list(set(discovered_videos)))
+        discovered_images = sorted(list(set(discovered_images)))
+
+        if max_videos is not None and max_videos > 0:
+            discovered_videos = discovered_videos[:max_videos]
+
+        print(f"🎬 Fuentes descubiertas para '{self.target_model}': {len(discovered_videos)} videos, {len(discovered_images)} imágenes.")
+
+        all_records: List[Dict[str, Any]] = []
+
+        # 1. Process discovered videos
+        for v_idx, v_path in enumerate(discovered_videos, 1):
+            if len(all_records) >= self.max_snapshots:
+                break
+            print(f"  [{v_idx}/{len(discovered_videos)}] Explorando video: {v_path.name}...")
+            try:
+                res = self.harvest_studio_situations(
+                    video_input=v_path,
+                    num_situations=situations_per_video
+                )
+                v_records = res.get("records", [])
+                all_records.extend(v_records)
+            except Exception as e:
+                print(f"    ⚠️ Error en video {v_path.name}: {e}")
+
+        # 2. Process discovered static images
+        for i_idx, img_p in enumerate(discovered_images, 1):
+            if len(all_records) >= self.max_snapshots:
+                break
+            try:
+                img_recs = self.harvest_from_image(img_p)
+                all_records.extend(img_recs)
+            except Exception as e:
+                pass
+
+        if self.supervise_agy and all_records:
+            all_records = AgySupervisor.supervise(all_records, self.target_model)
+            if self.db_manager:
+                for rec in all_records:
+                    self.db_manager.upsert_snapshot(rec)
+
+        primary_src = discovered_videos[0] if discovered_videos else (discovered_images[0] if discovered_images else self.output_dir)
+        return self._write_catalogs(primary_src, all_records)
 
 
 class VideoSnapshotPipeline:
@@ -1737,11 +2886,21 @@ class VideoSnapshotPipeline:
 def main():
     parser = argparse.ArgumentParser(
         prog="video-snapshot",
-        description="High-Precision Video Keyframe & Studio Snapshot Harvester with SQL/JSON Cataloging, Anthropometrics, and AGY Supervision."
+        description="High-Precision Video Keyframe & Studio Snapshot Harvester with Google Drive Multi-Account Support, SQL/JSON Cataloging, 32-Zone Anthropometrics, and AGY Supervision."
     )
-    parser.add_argument("video", nargs="?", help="Path to source video file (MP4, MKV, TS, WebM)")
+    parser.add_argument("inputs", nargs="*", help="Source video/image files, local directories, or Google Drive rclone remotes (e.g. gdrive_phone:Recurbate/uwuxo)")
     parser.add_argument("-m", "--model", default="unnamed_model", help="Target model name for dataset labeling")
     parser.add_argument("-o", "--output-dir", help="Output directory for extracted snapshots and catalog")
+    parser.add_argument("--origin", "--source-origin", "-s", "--source", choices=["auto", "local", "gdrive"], default="auto", help="Origin source provider for video/image training assets (local, gdrive, auto)")
+    parser.add_argument("--gdrive-remote", default="all", help="Specific Google Drive remote to query (e.g. gdrive_phone, gdrive_eng, gdrive_broker, gdrive_fdev, or all)")
+    parser.add_argument("--gdrive-folder", default="Recurbate", help="Base Google Drive folder to search for model media (default: Recurbate)")
+    parser.add_argument("--media-type", choices=["all", "videos", "photos"], default="all", help="Media type filter when harvesting multi-source (default: all)")
+    parser.add_argument("--max-videos", type=int, default=5, help="Maximum number of videos to explore from source (default: 5)")
+    parser.add_argument("--situations-per-video", type=int, default=4, help="Peak studio situations/snapshots to extract per video (default: 4)")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Recursively explore directories for media")
+    parser.add_argument("--clean-staging", action="store_true", help="Purge staged Google Drive media after harvesting snapshots")
+
+    # Extraction Engine Options
     parser.add_argument("--mode", choices=["keyframes", "scene", "interval"], default="interval", help="Extraction strategy (default: interval)")
     parser.add_argument("--fps", type=float, default=0.5, help="Sampling rate in frames per second (default: 0.5 = 1 frame/2s)")
     parser.add_argument("--min-sharpness", type=float, default=75.0, help="Laplacian variance threshold to reject motion blur (default: 75.0)")
@@ -1749,7 +2908,7 @@ def main():
     parser.add_argument("--dhash-threshold", type=int, default=8, help="Max Hamming distance to reject duplicate frames (default: 8)")
     parser.add_argument("--only-person", action="store_true", help="Filter: only save frames with verified human pose")
     parser.add_argument("--only-face", action="store_true", help="Filter: only save frames with verified frontal face")
-    parser.add_argument("--crop-regions", action="store_true", help="Extract multi-region anatomical crops (cara, breast, pompi, frente, aerola, piernas, brazos, torso)")
+    parser.add_argument("--crop-regions", action="store_true", help="Extract 32-zone anatomical crops (lateral arms/legs/areolas, crotch, facial, torso, etc.)")
     parser.add_argument("--start", help="Start timestamp in video (e.g. 00:01:30 or 90)")
     parser.add_argument("--end", help="End timestamp in video (e.g. 00:10:00 or 600)")
 
@@ -1770,25 +2929,51 @@ def main():
     parser.add_argument("--train-after", action="store_true", help="Automatically trigger biometric model enrollment using harvested snapshots")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose extraction telemetry")
 
+    # Interactive Active-Learning Studio Web UI
+    parser.add_argument("--web", "--studio-ui", dest="launch_web", action="store_true", help="Launch interactive Active-Learning Studio Web UI (Human-in-the-Loop Verifier & Trainer)")
+    parser.add_argument("--port", type=int, default=8585, help="Port for the Active-Learning Web UI (default: 8585)")
+
     args = parser.parse_args()
 
-    if not args.video:
-        parser.print_help()
-        return 1
-
-    vid_path = Path(os.path.expanduser(args.video)).resolve()
-    if not vid_path.is_file():
-        print(f"❌ Error: El archivo de video no existe: {vid_path}", file=sys.stderr)
-        return 1
+    if args.launch_web:
+        web_server_script = CURRENT_DIR / "web_studio_server.py"
+        web_cmd = [sys.executable, str(web_server_script), "--port", str(args.port)]
+        if args.db_path:
+            web_cmd.extend(["--db", str(args.db_path)])
+        elif args.output_dir:
+            out_p = Path(os.path.expanduser(args.output_dir)).resolve()
+            web_cmd.extend(["--db", str(out_p / "snapshots_catalog.db")])
+        print(f"🌐 Iniciando Servidor Web de Estudio Activo: http://localhost:{args.port}...")
+        return subprocess.run(web_cmd).returncode
 
     model_name = args.model.strip().lower()
 
+    # Determine origin
+    origin = args.origin
+    if origin == "auto":
+        if any(":" in str(inp) and not Path(str(inp)).exists() for inp in args.inputs):
+            origin = "gdrive"
+        elif not args.inputs and model_name != "unnamed_model":
+            # Check local external disk first
+            local_found = False
+            adata_root = Path("/media/fbetancourt/ADATA HD710 PRO1")
+            if adata_root.exists():
+                aliases = GoogleDriveSource._model_aliases(model_name)
+                for a in aliases:
+                    if (adata_root / a).exists():
+                        local_found = True
+                        break
+            origin = "local" if local_found else "gdrive"
+        else:
+            origin = "local"
+
+    # Destination directory
     if args.output_dir:
         out_dir = Path(os.path.expanduser(args.output_dir)).resolve()
-    elif args.model and args.model != "unnamed_model":
+    elif model_name != "unnamed_model":
         out_dir = Path.home() / "ComputerVision" / "datasets" / model_name / "photos" / "snapshots"
     else:
-        out_dir = vid_path.parent / f"{vid_path.stem}_snapshots"
+        out_dir = Path.cwd() / "harvested_snapshots"
 
     harvester = VideoSnapshotHarvester(
         output_dir=out_dir,
@@ -1800,29 +2985,148 @@ def main():
         only_face=args.only_face,
         crop_regions=args.crop_regions,
         target_model=model_name,
-        studio_mode=args.studio,
+        studio_mode=args.studio or True,
         situations=args.situations,
-        contact_sheet=args.contact_sheet or args.studio,
-        enable_db=args.enable_db,
+        contact_sheet=args.contact_sheet or args.studio or True,
+        enable_db=args.enable_db or True,
         db_path=args.db_path,
-        store_blob=args.store_blob,
+        store_blob=args.store_blob or True,
         supervise_agy=args.supervise_agy,
         verbose=args.verbose or True
     )
 
     t0 = time.time()
-    print(f"\n🚀 Iniciando extracción de snapshots con {harvester.output_dir.name}...")
+    staged_to_clean: List[Path] = []
+    result: Dict[str, Any] = {}
 
-    if args.timestamps:
-        ts_list = [t.strip() for t in args.timestamps.split(",") if t.strip()]
-        result = harvester.harvest_from_timestamps(vid_path, ts_list)
-    else:
-        result = harvester.harvest_from_video(
-            video_input=vid_path,
-            start_time=args.start,
-            end_time=args.end,
-            fps_interval=args.fps
-        )
+    print(f"\n🚀 Iniciando extracción con VideoSnapshotHarvester:")
+    print(f"   👤 Modelo objetivo: {model_name}")
+    print(f"   🌐 Origen seleccionado: {origin.upper()}")
+    print(f"   📁 Directorio de salida: {out_dir}")
+
+    try:
+        # ==========================================
+        # ORIGIN: GOOGLE DRIVE
+        # ==========================================
+        if origin == "gdrive":
+            remotes = None if args.gdrive_remote == "all" else [args.gdrive_remote]
+            staged_files: List[Path] = []
+
+            # Case A: Inputs contain direct remote path(s)
+            remote_inputs = [inp for inp in args.inputs if ":" in inp and not Path(inp).exists()]
+            if remote_inputs:
+                for r_inp in remote_inputs:
+                    # Check if single remote file or remote directory
+                    if Path(r_inp).suffix.lower() in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".jpg", ".jpeg", ".png"}:
+                        stg = GoogleDriveSource.stage_file(r_inp)
+                        if stg:
+                            staged_files.append(stg)
+                    else:
+                        # Remote folder: list items
+                        cmd = ["rclone", "lsjson", r_inp, "--max-depth", "1"]
+                        try:
+                            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                            if res.returncode == 0 and res.stdout.strip():
+                                items = json.loads(res.stdout)
+                                for item in items:
+                                    if item.get("IsDir"):
+                                        continue
+                                    fname = item.get("Name", "")
+                                    ext = Path(fname).suffix.lower()
+                                    if ext in {".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".jpg", ".jpeg", ".png"}:
+                                        sub_remote = f"{r_inp.rstrip('/')}/{fname}"
+                                        stg = GoogleDriveSource.stage_file(sub_remote)
+                                        if stg:
+                                            staged_files.append(stg)
+                                        if len(staged_files) >= args.max_videos:
+                                            break
+                        except Exception as e:
+                            print(f"⚠️ Error listando carpeta remota {r_inp}: {e}")
+
+            # Case B: Search Google Drive accounts by model name
+            if not staged_files and model_name != "unnamed_model":
+                print(f"🔍 Buscando archivos de '{model_name}' en cuentas Google Drive ({args.gdrive_remote})...")
+                discovered = GoogleDriveSource.search_model_media(
+                    model_name=model_name,
+                    remotes=remotes,
+                    base_folder=args.gdrive_folder,
+                    media_type=args.media_type,
+                    max_files=args.max_videos
+                )
+                print(f"   Encontrados {len(discovered)} archivos en Google Drive.")
+                for item in discovered:
+                    stg = GoogleDriveSource.stage_file(item["remote_path"])
+                    if stg:
+                        staged_files.append(stg)
+
+            if not staged_files:
+                print(f"❌ No se encontraron archivos para cosechar en Google Drive para '{model_name}'.", file=sys.stderr)
+                return 1
+
+            if args.clean_staging:
+                staged_to_clean.extend(staged_files)
+
+            print(f"🎬 Cosechando snapshots desde {len(staged_files)} archivos de Google Drive...")
+            result = harvester.harvest_multi_source(
+                sources=staged_files,
+                recursive=args.recursive,
+                media_type=args.media_type,
+                max_videos=args.max_videos,
+                situations_per_video=args.situations_per_video
+            )
+
+        # ==========================================
+        # ORIGIN: LOCAL FILESYSTEM / DISK
+        # ==========================================
+        else:
+            local_sources: List[Union[Path, str]] = []
+
+            if args.inputs:
+                for inp in args.inputs:
+                    p = Path(os.path.expanduser(inp)).resolve()
+                    if p.exists():
+                        local_sources.append(p)
+                    else:
+                        print(f"⚠️ Ruta no encontrada: {inp}")
+
+            # If no inputs provided, discover from external disk or datasets
+            if not local_sources and model_name != "unnamed_model":
+                adata_root = Path("/media/fbetancourt/ADATA HD710 PRO1")
+                aliases = GoogleDriveSource._model_aliases(model_name)
+                for a in aliases:
+                    cand = adata_root / a
+                    if cand.is_dir():
+                        local_sources.append(cand)
+                        break
+
+            if not local_sources:
+                print(f"❌ Error: No se especificaron archivos/rutas locales válidas y no se halló carpeta para '{model_name}'.", file=sys.stderr)
+                return 1
+
+            # If single file and specific timestamps requested
+            if len(local_sources) == 1 and Path(local_sources[0]).is_file() and args.timestamps:
+                ts_list = [t.strip() for t in args.timestamps.split(",") if t.strip()]
+                result = harvester.harvest_from_timestamps(local_sources[0], ts_list)
+            elif len(local_sources) == 1 and Path(local_sources[0]).is_file() and not args.recursive:
+                result = harvester.harvest_from_video(
+                    video_input=local_sources[0],
+                    start_time=args.start,
+                    end_time=args.end,
+                    fps_interval=args.fps
+                )
+            else:
+                result = harvester.harvest_multi_source(
+                    sources=local_sources,
+                    recursive=args.recursive or True,
+                    media_type=args.media_type,
+                    max_videos=args.max_videos,
+                    situations_per_video=args.situations_per_video
+                )
+
+    finally:
+        if staged_to_clean:
+            print(f"🧹 Limpiando {len(staged_to_clean)} archivos temporales de staging...")
+            GoogleDriveSource.clean_staging(staged_to_clean)
 
     elapsed = time.time() - t0
     saved = result.get("total_records", len(result.get("records", [])))
@@ -1835,6 +3139,7 @@ def main():
     if harvester.db_manager:
         print(f"   🗄️ Base de datos SQLite: {harvester.db_manager.db_path}")
 
+    # Re-entrenamiento biométrico automático si se solicitó
     if args.train_after and model_name != "unnamed_model":
         print(f"\n🔄 Entrenando modelo biométrico para '{model_name}'...")
         train_cmd = [
@@ -1852,3 +3157,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
