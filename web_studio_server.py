@@ -1142,7 +1142,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         models.forEach(m => {
           const opt = document.createElement('option');
           opt.value = m.model_name;
-          opt.textContent = `${m.model_name} (${m.count} recortes)`;
+          const countNum = m.total !== undefined ? m.total : (m.count || 0);
+          opt.textContent = `${m.model_name} (${countNum} recortes)`;
           modelSelect.appendChild(opt);
 
           const opt2 = document.createElement('option');
@@ -1513,7 +1514,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           const res = await fetch(`/api/harvest/status/${jobId}`);
           const job = await res.json();
           if (job.log) {
-            consoleBox.textContent = job.log.join('\n');
+            consoleBox.textContent = job.log.join(String.fromCharCode(10));
             consoleBox.scrollTop = consoleBox.scrollHeight;
           }
           if (job.status === 'completed' || job.status === 'failed') {
