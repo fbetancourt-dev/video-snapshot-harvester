@@ -25,6 +25,8 @@ import sqlite3
 import argparse
 import asyncio
 import subprocess
+import cv2
+import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -89,6 +91,7 @@ class WebStudioApp:
         self.db_path = Path(db_path).resolve()
         self.db_manager = SnapshotDatabaseManager(self.db_path)
         self.blob_semaphore = asyncio.Semaphore(8)
+        self.bbox_cache: Dict[int, Dict[str, Any]] = {}
 
     async def get_models(self, request: web.Request) -> web.Response:
         models = await asyncio.to_thread(self.db_manager.get_models_summary)
@@ -197,6 +200,7 @@ class WebStudioApp:
 
     async def get_master_snapshots(self, request: web.Request) -> web.Response:
         model = request.query.get("model", "all")
+        status = request.query.get("status", "all")
         page = max(1, int(request.query.get("page", 1)))
         limit = max(1, min(100, int(request.query.get("limit", 24))))
         offset = (page - 1) * limit
@@ -210,13 +214,16 @@ class WebStudioApp:
                 if model != "all":
                     base_cond += " AND model_name=?"
                     params.append(model)
+                if status != "all":
+                    base_cond += " AND status=?"
+                    params.append(status)
 
                 c.execute(f"SELECT COUNT(*) FROM snapshots WHERE {base_cond}", tuple(params))
                 total = c.fetchone()[0]
 
                 sql = f"""
                     SELECT s.id, s.model_name, s.image_filename, s.source_video, s.timestamp_str,
-                           s.studio_score, s.sharpness, s.status, s.created_at,
+                           s.studio_score, s.sharpness, s.status, s.review_note, s.created_at,
                            (SELECT COUNT(*) FROM snapshots c WHERE c.parent_snapshot_id = s.id) as crops_count
                     FROM snapshots s
                     WHERE {base_cond}
@@ -236,6 +243,36 @@ class WebStudioApp:
             "pages": (total + limit - 1) // limit if total > 0 else 1
         })
 
+    async def reject_master_snapshot(self, request: web.Request) -> web.Response:
+        master_id = int(request.match_info["id"])
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        note = body.get("note", "Descarte de foto maestra: no apta para aprendizaje (banner/outro/mala iluminación)").strip()
+        error_category = body.get("error_category", "Outro / Banner Publicitario / No Apto").strip()
+
+        def _do_reject():
+            with sqlite3.connect(str(self.db_path)) as conn:
+                c = conn.cursor()
+                # 1. Update master snapshot
+                c.execute("UPDATE snapshots SET status='rejected', review_note=? WHERE id=?", (note, master_id))
+                # 2. Update child crops in cascade
+                c.execute("UPDATE snapshots SET status='rejected', review_note=? WHERE parent_snapshot_id=?", (f"Descarte en cascada de Master #{master_id}: {note}", master_id))
+                # 3. Log to cognitive feedback memory
+                c.execute("SELECT model_name, zone_type FROM snapshots WHERE id=?", (master_id,))
+                row = c.fetchone()
+                if row:
+                    m_name, z_type = row
+                    c.execute("""
+                        INSERT INTO cognitive_feedback_memory (snapshot_id, model_name, zone_type, error_category, user_correction_note)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (master_id, m_name, z_type or "cuerpo", error_category, note))
+                conn.commit()
+
+        await asyncio.to_thread(_do_reject)
+        return web.json_response({"success": True, "master_id": master_id, "status": "rejected"})
+
     async def get_master_crops(self, request: web.Request) -> web.Response:
         master_id = int(request.match_info["id"])
 
@@ -243,18 +280,69 @@ class WebStudioApp:
             with sqlite3.connect(str(self.db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 c = conn.cursor()
-                c.execute("SELECT id, model_name, image_filename, timestamp_str, source_video, sharpness, studio_score, description FROM snapshots WHERE id=?", (master_id,))
+                c.execute("SELECT id, model_name, image_filename, image_path, timestamp_str, source_video, sharpness, studio_score, description FROM snapshots WHERE id=?", (master_id,))
                 m_row = c.fetchone()
                 master_info = dict(m_row) if m_row else None
+                if not master_info:
+                    return None, []
 
                 # Child crops: matched by parent_snapshot_id OR same video & near timestamp
                 c.execute("""
-                    SELECT id, model_name, image_filename, zone_type, studio_score, sharpness, status, review_note, description
+                    SELECT id, model_name, image_filename, image_path, zone_type, studio_score, sharpness, status, review_note, description, skin_tone_hex
                     FROM snapshots
                     WHERE parent_snapshot_id=? OR (parent_snapshot_id IS NULL AND source_video=? AND ABS(timestamp_sec - ?) < 0.2 AND id != ?)
                     ORDER BY id ASC
                 """, (master_id, master_info.get("source_video") if master_info else "", 0.0, master_id))
                 crops = [dict(r) for r in c.fetchall()]
+
+                m_path = master_info.get("image_path")
+                if m_path and os.path.exists(m_path):
+                    m_img = cv2.imread(m_path)
+                    if m_img is not None:
+                        m_h, m_w = m_img.shape[:2]
+                        master_info["width"] = m_w
+                        master_info["height"] = m_h
+                        m_gray = cv2.cvtColor(m_img, cv2.COLOR_BGR2GRAY)
+
+                        for crop in crops:
+                            cid = crop["id"]
+                            if cid in self.bbox_cache:
+                                cached = self.bbox_cache[cid]
+                                crop["bbox"] = cached["bbox"]
+                                crop["crop_width"] = cached["crop_width"]
+                                crop["crop_height"] = cached["crop_height"]
+                                continue
+
+                            c_path = crop.get("image_path")
+                            if c_path and os.path.exists(c_path):
+                                c_img = cv2.imread(c_path)
+                                if c_img is not None:
+                                    c_h, c_w = c_img.shape[:2]
+                                    crop["crop_width"] = c_w
+                                    crop["crop_height"] = c_h
+                                    if c_w <= m_w and c_h <= m_h:
+                                        c_gray = cv2.cvtColor(c_img, cv2.COLOR_BGR2GRAY)
+                                        res = cv2.matchTemplate(m_gray, c_gray, cv2.TM_CCOEFF_NORMED)
+                                        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                                        if max_val > 0.60:
+                                            x, y = max_loc
+                                            box_info = {
+                                                "x": int(x),
+                                                "y": int(y),
+                                                "w": int(c_w),
+                                                "h": int(c_h),
+                                                "rel_x": round(float(x) / m_w, 4),
+                                                "rel_y": round(float(y) / m_h, 4),
+                                                "rel_w": round(float(c_w) / m_w, 4),
+                                                "rel_h": round(float(c_h) / m_h, 4)
+                                            }
+                                            crop["bbox"] = box_info
+                                            self.bbox_cache[cid] = {
+                                                "bbox": box_info,
+                                                "crop_width": c_w,
+                                                "crop_height": c_h
+                                            }
+
                 return master_info, crops
 
         master_info, crops = await asyncio.to_thread(_fetch_crops)
@@ -911,6 +999,88 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       border-color: #60a5fa;
     }
 
+    /* Hierarchical Inspector: Crop List & Zoom Box Styles */
+    .crop-list-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 0.4rem;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .crop-list-row:hover {
+      background: #253349;
+      border-color: #64748b;
+      transform: translateX(2px);
+    }
+    .crop-list-row.selected {
+      background: #0c4a6e !important;
+      border-color: #38bdf8 !important;
+      box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+    }
+    .crop-list-row.verified {
+      border-left: 4px solid #10b981;
+    }
+    .crop-list-row.rejected {
+      border-left: 4px solid #ef4444;
+      opacity: 0.65;
+    }
+    .crop-list-thumb {
+      width: 44px;
+      height: 44px;
+      border-radius: 5px;
+      object-fit: cover;
+      border: 1px solid #475569;
+      background: #020617;
+      flex-shrink: 0;
+    }
+    .crop-zone-label {
+      font-weight: 600;
+      font-size: 0.85rem;
+      color: #f1f5f9;
+    }
+    .crop-status-indicator {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .crop-status-indicator.pending { background: #eab308; }
+    .crop-status-indicator.verified { background: #10b981; }
+    .crop-status-indicator.rejected { background: #ef4444; }
+
+    #crop-highlight-box {
+      position: absolute;
+      display: none;
+      pointer-events: none;
+      border: 2.5px solid #38bdf8;
+      box-shadow: 0 0 14px rgba(56, 189, 248, 0.9), inset 0 0 10px rgba(56, 189, 248, 0.35);
+      background: rgba(56, 189, 248, 0.18);
+      border-radius: 4px;
+      transition: all 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 10;
+    }
+    #crop-highlight-label {
+      position: absolute;
+      top: -24px;
+      left: 0;
+      background: #0284c7;
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 3px;
+      white-space: nowrap;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
     /* Pagination */
     .pagination {
       display: flex;
@@ -951,6 +1121,15 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           <label for="master-model-select">Modelo Biométrico</label>
           <select id="master-model-select">
             <option value="all">Todos los Modelos</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="master-status-select">Estado de Inspección</label>
+          <select id="master-status-select">
+            <option value="all">Todos los Estados</option>
+            <option value="pending">Pendientes de Revisión ⏳</option>
+            <option value="verified">Verificados ✅</option>
+            <option value="rejected">Descartados ❌</option>
           </select>
         </div>
         <div id="master-stat-count" class="status-indicator">Cargando snapshots maestros...</div>
@@ -1160,40 +1339,88 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-  <!-- MODAL INSPECTOR: SNAPSHOT MAESTRO ➔ RECORTES ANATÓMICOS -->
+  <!-- MODAL INSPECTOR: SNAPSHOT MAESTRO ➔ RECORTES ANATÓMICOS CON ZOOM Y SELECCIÓN -->
   <div id="master-crop-modal" class="modal-overlay">
-    <div class="modal-card" style="max-width: 1150px; width: 95%; height: 85vh; max-height: 850px; display: flex; flex-direction: column;">
+    <div class="modal-card" style="max-width: 1280px; width: 96%; height: 90vh; max-height: 900px; display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 0.8rem;">
         <div>
           <h3 id="modal-master-title" style="margin: 0; font-size: 1.15rem; color: #60a5fa;">📸 Inspección Jerárquica de Snapshot</h3>
           <span id="modal-master-meta" style="font-size: 0.8rem; color: var(--text-muted);">Foto original vs Recortes extraídos</span>
         </div>
-        <button id="btn-close-master-modal" class="btn btn-secondary" style="padding: 0.3rem 0.8rem; font-size: 1rem;">✕ Cerrar</button>
+        <div style="display: flex; gap: 0.6rem; align-items: center;">
+          <button id="btn-reject-master-modal" class="btn btn-danger" style="padding: 0.35rem 0.8rem; font-size: 0.8rem; background: #dc2626; border-color: #ef4444;" title="Descartar foto maestra y todos sus recortes">✕ Descartar Foto Maestra</button>
+          <button id="btn-close-master-modal" class="btn btn-secondary" style="padding: 0.3rem 0.8rem; font-size: 1rem;">✕ Cerrar</button>
+        </div>
       </div>
 
-      <div style="display: flex; gap: 1.5rem; flex: 1; overflow: hidden; margin-top: 1rem;">
-        <!-- Panel Izquierdo: Foto Original Completa -->
-        <div style="flex: 1.1; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
-          <div style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; display: flex; justify-content: space-between;">
-            <span>🖼️ Fotograma Original Completo</span>
-            <span id="modal-master-sharpness">Nitidez: --</span>
+      <div style="display: flex; gap: 1.2rem; flex: 1; overflow: hidden; margin-top: 0.8rem;">
+        <!-- Panel Izquierdo: Fotograma Original con Bounding Box + Ventana de Zoom Detallado -->
+        <div style="flex: 1.2; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
+          <div style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: 600; color: #94a3b8;">🖼️ Fotograma Original Completo</span>
+            <span id="modal-master-sharpness" style="font-size: 0.75rem; color: #38bdf8;">Nitidez: --</span>
           </div>
-          <div style="flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #020617; border-radius: 6px;">
-            <img id="modal-master-img" src="" alt="Snapshot Original" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+
+          <!-- Contenedor Maestro con Bounding Box Interactivo -->
+          <div style="flex: 1.2; min-height: 250px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #020617; border-radius: 6px; padding: 4px; position: relative;">
+            <div id="master-img-wrapper" style="position: relative; display: inline-block; line-height: 0; max-width: 100%; max-height: 100%;">
+              <img id="modal-master-img" src="" alt="Snapshot Original" style="max-width: 100%; max-height: 380px; width: auto; height: auto; display: block; border-radius: 4px; object-fit: contain;">
+              <div id="crop-highlight-box">
+                <span id="crop-highlight-label"></span>
+              </div>
+            </div>
           </div>
-          <div id="modal-master-desc" style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.5rem; max-height: 40px; overflow: hidden; text-overflow: ellipsis;"></div>
+          <div id="modal-master-desc" style="font-size: 0.72rem; color: #94a3b8; margin-top: 0.4rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+
+          <!-- Recuadro con Zoom en la zona de interés recortada -->
+          <div style="margin-top: 0.6rem; background: #0a0f1d; border: 1px solid #1e293b; border-radius: 6px; padding: 0.6rem; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+              <span style="font-size: 0.8rem; font-weight: 600; color: #38bdf8; display: flex; align-items: center; gap: 0.4rem;">
+                🔍 Zoom & Detalle Fino: <span id="zoom-crop-zone" style="color: #f8fafc;">Selecciona un recorte</span>
+              </span>
+              <span id="zoom-crop-res" style="font-size: 0.75rem; color: #94a3b8; font-family: monospace;">-- x -- px</span>
+            </div>
+            <div style="display: flex; gap: 0.8rem; align-items: center;">
+              <div style="width: 140px; height: 140px; min-width: 140px; background: #020617; border-radius: 6px; border: 1px solid #334155; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+                <img id="modal-zoom-img" src="" alt="Zoom Recorte" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+                <span id="zoom-badge-status" class="status-badge" style="position: absolute; top: 4px; right: 4px; font-size: 0.65rem; padding: 2px 5px;">--</span>
+              </div>
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.75rem;">
+                <div style="display: flex; justify-content: space-between;">
+                  <span style="color: #64748b;">Nitidez Local:</span>
+                  <span id="zoom-crop-lap" style="color: #38bdf8; font-weight: 600;">--</span>
+                </div>
+                <div style="display: flex; justify-content: space-between;">
+                  <span style="color: #64748b;">Calidad Estudio:</span>
+                  <span id="zoom-crop-score" style="color: #facc15; font-weight: 600;">--</span>
+                </div>
+                <div style="display: flex; justify-content: space-between;">
+                  <span style="color: #64748b;">Tono de Piel:</span>
+                  <span id="zoom-crop-skin" style="color: #e2e8f0; font-family: monospace;">--</span>
+                </div>
+                <div style="display: flex; justify-content: space-between;">
+                  <span style="color: #64748b;">Estado:</span>
+                  <span id="zoom-crop-status-text" style="color: #94a3b8; font-weight: 600;">Pendiente</span>
+                </div>
+                <div style="display: flex; gap: 0.5rem; margin-top: 0.3rem;">
+                  <button id="btn-zoom-verify" class="btn btn-sm btn-verify" style="flex: 1; padding: 0.3rem; font-size: 0.75rem;">✔ Aprobar Recorte</button>
+                  <button id="btn-zoom-reject" class="btn btn-sm btn-reject" style="flex: 1; padding: 0.3rem; font-size: 0.75rem;">✕ Descartar</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <!-- Panel Derecho: Recortes Anatómicos Extraídos -->
-        <div style="flex: 1.4; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-            <span style="font-size: 0.85rem; color: #38bdf8; font-weight: 600;">✂️ Recortes Anatómicos Extraídos (<span id="modal-crops-count">0</span>)</span>
+        <!-- Panel Derecho: Lista de Recortes Anatómicos Extraídos -->
+        <div style="flex: 1.1; display: flex; flex-direction: column; background: #0f172a; border-radius: 8px; border: 1px solid #334155; padding: 0.8rem; overflow: hidden;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; border-bottom: 1px solid #1e293b; padding-bottom: 0.4rem;">
+            <span style="font-size: 0.85rem; color: #38bdf8; font-weight: 600;">📋 Lista de Recortes (<span id="modal-crops-count">0</span>)</span>
             <div style="display: flex; gap: 0.5rem;">
               <button id="btn-approve-all-crops" class="btn btn-primary" style="padding: 0.25rem 0.6rem; font-size: 0.75rem;">✔ Aprobar Todos</button>
             </div>
           </div>
-          <div id="modal-crops-container" style="flex: 1; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.8rem; padding-right: 0.3rem;">
-            <!-- Se inyectan las tarjetas de cada recorte -->
+          <div id="modal-crops-list" style="flex: 1; overflow-y: auto; padding-right: 0.3rem;">
+            <!-- Se inyectan las filas de cada recorte como lista -->
           </div>
         </div>
       </div>
@@ -1231,6 +1458,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
     // State
     let currentMasterModel = "all";
+    let currentMasterStatus = "all";
     let currentMasterPage = 1;
     let currentActiveMasterId = null;
 
@@ -1307,7 +1535,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       grid.innerHTML = '<div style="color: var(--text-muted); padding: 2rem;">Cargando snapshots maestros...</div>';
 
       try {
-        const res = await fetch(`/api/masters?model=${currentMasterModel}&page=${currentMasterPage}&limit=24`);
+        const res = await fetch(`/api/masters?model=${currentMasterModel}&status=${currentMasterStatus}&page=${currentMasterPage}&limit=24`);
         const data = await res.json();
 
         statBox.textContent = `Total: ${data.total} fotos originales | Pág ${data.page}/${data.pages}`;
@@ -1315,33 +1543,46 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         grid.innerHTML = '';
         if (!data.masters || data.masters.length === 0) {
-          grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; padding: 3rem; text-align: center;">No hay snapshots maestros disponibles.</div>';
+          grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; padding: 3rem; text-align: center;">No hay snapshots maestros para este filtro.</div>';
           return;
         }
 
         data.masters.forEach(item => {
+          const isRej = item.status === 'rejected';
+          const isVer = item.status === 'verified';
           const card = document.createElement('div');
           card.className = `card ${item.status || 'pending'}`;
-          card.style.cursor = 'pointer';
+          if (isRej) card.style.opacity = '0.65';
+          card.id = `master-card-${item.id}`;
+
+          const statusBadge = isRej
+            ? '<span class="score-badge" style="background: rgba(239, 68, 68, 0.9); color: white;">✕ Descartada</span>'
+            : (isVer
+              ? '<span class="score-badge" style="background: rgba(16, 185, 129, 0.9); color: white;">✔ Verificada</span>'
+              : `<span class="score-badge">★ ${(item.studio_score || 0).toFixed(1)}</span>`);
+
           card.innerHTML = `
-            <div class="card-img-wrapper">
+            <div class="card-img-wrapper" style="cursor: pointer;" onclick="inspectMasterSnapshot(${item.id})">
               <img class="card-img" src="/api/image/${item.id}" alt="${item.image_filename}">
               <span class="zone-badge" style="background: rgba(14, 165, 233, 0.85);">📸 ${item.timestamp_str || 'Escena'}</span>
-              <span class="score-badge">★ ${(item.studio_score || 0).toFixed(1)}</span>
+              ${statusBadge}
             </div>
             <div class="card-body">
-              <div class="card-title">
+              <div class="card-title" style="cursor: pointer;" onclick="inspectMasterSnapshot(${item.id})">
                 <span>${item.model_name}</span>
                 <span class="card-meta">Laplacian: ${(item.sharpness || 0).toFixed(1)}</span>
               </div>
-              <p class="card-desc">${item.source_video || 'Video'}</p>
-              <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center;">
+              <p class="card-desc" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${item.source_video || 'Video'}</p>
+              ${item.review_note ? `<div style="font-size: 0.7rem; color: #ef4444; margin-top: 0.2rem; font-style: italic;">Motivo: ${item.review_note}</div>` : ''}
+              <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.4rem;">
                 <span style="font-size: 0.8rem; color: #38bdf8; font-weight: 600;">✂️ ${item.crops_count || 0} recortes</span>
-                <button class="btn btn-secondary" style="padding: 0.25rem 0.6rem; font-size: 0.75rem;">🔍 Inspeccionar</button>
+                <div style="display: flex; gap: 0.35rem;">
+                  <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="inspectMasterSnapshot(${item.id})">🔍 Inspeccionar</button>
+                  ${!isRej ? `<button class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; background: #dc2626; border-color: #ef4444;" onclick="quickRejectMaster(${item.id}, event)" title="Descartar foto maestra y todos sus recortes">✕ Descartar</button>` : ''}
+                </div>
               </div>
             </div>
           `;
-          card.addEventListener('click', () => inspectMasterSnapshot(item.id));
           grid.appendChild(card);
         });
       } catch (err) {
@@ -1350,12 +1591,37 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function quickRejectMaster(masterId, e) {
+      if (e) e.stopPropagation();
+      const reason = prompt("¿Motivo para descartar esta foto maestra (ej: Banner publicitario, texto, mala pose, desenfoque)?", "Banner publicitario / Outro / No apto");
+      if (reason === null) return;
+      try {
+        const res = await fetch(`/api/master/${masterId}/reject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: reason || 'Descartada por el usuario como mala para aprendizaje' })
+        });
+        const data = await res.json();
+        if (data.success) {
+          loadMasterSnapshots();
+        }
+      } catch (err) {
+        console.error("Error rejecting master:", err);
+      }
+    }
+
+    let currentModalCrops = [];
+    let currentActiveCropId = null;
+
     // Inspect Master Snapshot & Its Derived Crops
     async function inspectMasterSnapshot(masterId) {
       currentActiveMasterId = masterId;
       const modal = document.getElementById('master-crop-modal');
-      const container = document.getElementById('modal-crops-container');
-      container.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">Cargando recortes anatómicos derivados...</div>';
+      const cropsList = document.getElementById('modal-crops-list');
+      const box = document.getElementById('crop-highlight-box');
+      if (box) box.style.display = 'none';
+
+      cropsList.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">Cargando recortes anatómicos...</div>';
       modal.classList.add('active');
 
       try {
@@ -1367,6 +1633,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         const m = data.master;
+        currentModalCrops = data.crops || [];
         document.getElementById('modal-master-title').textContent = `📸 Inspección: ${m.model_name} (${m.timestamp_str || ''})`;
         document.getElementById('modal-master-meta').textContent = `${m.source_video || ''} | Foto ID #${m.id}`;
         document.getElementById('modal-master-sharpness').textContent = `Nitidez: ${(m.sharpness || 0).toFixed(1)} | Calidad: ★ ${(m.studio_score || 0).toFixed(1)}`;
@@ -1374,39 +1641,133 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('modal-master-desc').textContent = m.description || '';
         document.getElementById('modal-crops-count').textContent = data.crops_count;
 
-        container.innerHTML = '';
-        if (!data.crops || data.crops.length === 0) {
-          container.innerHTML = '<div style="color: var(--text-muted); padding: 2rem; grid-column: 1/-1; text-align: center;">No hay recortes anatómicos derivados para este snapshot.</div>';
+        cropsList.innerHTML = '';
+        if (currentModalCrops.length === 0) {
+          cropsList.innerHTML = '<div style="color: var(--text-muted); padding: 2rem; text-align: center;">No hay recortes anatómicos derivados para este snapshot.</div>';
+          clearZoomPanel();
           return;
         }
 
-        data.crops.forEach(c => {
-          const card = document.createElement('div');
-          card.className = `card ${c.status || 'pending'}`;
-          card.id = `modal-crop-${c.id}`;
-          card.style.margin = '0';
-          card.innerHTML = `
-            <div class="card-img-wrapper" style="height: 120px;">
-              <img class="card-img" src="/api/image/${c.id}" alt="${c.image_filename}">
-              <span class="zone-badge">${c.zone_type}</span>
-              <span class="score-badge" style="font-size: 0.65rem;">★ ${(c.studio_score || 0).toFixed(1)}</span>
+        currentModalCrops.forEach((c) => {
+          const row = document.createElement('div');
+          row.className = `crop-list-row ${c.status || 'pending'}`;
+          row.id = `modal-crop-row-${c.id}`;
+
+          const cW = c.crop_width || (c.bbox ? c.bbox.w : '?');
+          const cH = c.crop_height || (c.bbox ? c.bbox.h : '?');
+
+          row.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 0.75rem; flex: 1; min-width: 0;">
+              <img src="/api/image/${c.id}" class="crop-list-thumb" alt="${c.zone_type}">
+              <div style="min-width: 0;">
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                  <span class="crop-zone-label">${c.zone_type}</span>
+                  <span class="crop-status-indicator ${c.status || 'pending'}"></span>
+                </div>
+                <div style="font-size: 0.72rem; color: #94a3b8; margin-top: 2px;">
+                  Lap: <b style="color: #38bdf8;">${(c.sharpness || 0).toFixed(1)}</b> &bull; ★ ${(c.studio_score || 0).toFixed(1)} &bull; ${cW}x${cH}px
+                </div>
+              </div>
             </div>
-            <div class="card-body" style="padding: 0.5rem;">
-              <div style="font-size: 0.75rem; color: #94a3b8; display: flex; justify-content: space-between;">
-                <span>${c.zone_type}</span>
-                <span>Lap: ${(c.sharpness || 0).toFixed(1)}</span>
-              </div>
-              <div class="card-actions" style="margin-top: 0.4rem;">
-                <button class="btn btn-sm btn-verify" style="font-size: 0.7rem; padding: 0.2rem 0.4rem;" onclick="verifyCropInModal(${c.id}, event)">✔</button>
-                <button class="btn btn-sm btn-reject" style="font-size: 0.7rem; padding: 0.2rem 0.4rem;" onclick="rejectCropInModal(${c.id}, event)">✕</button>
-              </div>
+            <div style="display: flex; gap: 0.4rem; align-items: center; margin-left: 0.5rem;">
+              <button class="btn btn-sm btn-verify" style="padding: 0.2rem 0.5rem; font-size: 0.75rem;" onclick="verifyCropInModal(${c.id}, event)" title="Aprobar recorte">✔</button>
+              <button class="btn btn-sm btn-reject" style="padding: 0.2rem 0.5rem; font-size: 0.75rem;" onclick="rejectCropInModal(${c.id}, event)" title="Descartar recorte">✕</button>
             </div>
           `;
-          container.appendChild(card);
+
+          row.addEventListener('click', () => selectCropInModal(c.id));
+          row.addEventListener('mouseenter', () => highlightCropBox(c.id));
+          cropsList.appendChild(row);
         });
+
+        // Select first crop by default (or 'cara' if present)
+        const defaultCrop = currentModalCrops.find(cr => cr.zone_type === 'cara') || currentModalCrops[0];
+        if (defaultCrop) {
+          selectCropInModal(defaultCrop.id);
+        }
+
       } catch (err) {
         console.error("Error inspecting master:", err);
       }
+    }
+
+    function selectCropInModal(cropId) {
+      currentActiveCropId = cropId;
+      const crop = currentModalCrops.find(c => c.id === cropId);
+      if (!crop) return;
+
+      // Update row selection style
+      document.querySelectorAll('.crop-list-row').forEach(r => r.classList.remove('selected'));
+      const activeRow = document.getElementById(`modal-crop-row-${cropId}`);
+      if (activeRow) activeRow.classList.add('selected');
+
+      // Update Bounding Box on Master Image
+      highlightCropBox(cropId);
+
+      // Update Zoom Preview Panel
+      updateZoomPanel(crop);
+    }
+
+    function highlightCropBox(cropId) {
+      const crop = currentModalCrops.find(c => c.id === cropId);
+      const box = document.getElementById('crop-highlight-box');
+      const label = document.getElementById('crop-highlight-label');
+
+      if (!crop || !crop.bbox) {
+        if (box) box.style.display = 'none';
+        return;
+      }
+
+      box.style.left = `${(crop.bbox.rel_x * 100).toFixed(2)}%`;
+      box.style.top = `${(crop.bbox.rel_y * 100).toFixed(2)}%`;
+      box.style.width = `${(crop.bbox.rel_w * 100).toFixed(2)}%`;
+      box.style.height = `${(crop.bbox.rel_h * 100).toFixed(2)}%`;
+      box.style.display = 'block';
+
+      const cW = crop.crop_width || crop.bbox.w;
+      const cH = crop.crop_height || crop.bbox.h;
+      label.textContent = `${crop.zone_type} (${cW}x${cH}px)`;
+    }
+
+    function updateZoomPanel(crop) {
+      const zoomImg = document.getElementById('modal-zoom-img');
+      zoomImg.src = `/api/image/${crop.id}`;
+
+      const cW = crop.crop_width || (crop.bbox ? crop.bbox.w : '?');
+      const cH = crop.crop_height || (crop.bbox ? crop.bbox.h : '?');
+
+      document.getElementById('zoom-crop-zone').textContent = crop.zone_type;
+      document.getElementById('zoom-crop-res').textContent = `${cW} x ${cH} px`;
+      document.getElementById('zoom-crop-lap').textContent = (crop.sharpness || 0).toFixed(1);
+      document.getElementById('zoom-crop-score').textContent = `★ ${(crop.studio_score || 0).toFixed(1)}`;
+      document.getElementById('zoom-crop-skin').textContent = crop.skin_tone_hex || 'N/A';
+
+      const statusEl = document.getElementById('zoom-crop-status-text');
+      const badgeEl = document.getElementById('zoom-badge-status');
+      const isVer = crop.status === 'verified';
+      const isRej = crop.status === 'rejected';
+
+      statusEl.textContent = isVer ? 'Verificado ✅' : (isRej ? 'Descartado ❌' : 'Pendiente ⏳');
+      statusEl.style.color = isVer ? '#10b981' : (isRej ? '#ef4444' : '#eab308');
+
+      badgeEl.textContent = isVer ? 'Aprobado' : (isRej ? 'Descartado' : 'Pendiente');
+      badgeEl.className = `status-badge ${crop.status || 'pending'}`;
+
+      // Wire zoom panel buttons
+      const btnVer = document.getElementById('btn-zoom-verify');
+      const btnRej = document.getElementById('btn-zoom-reject');
+      btnVer.onclick = (e) => verifyCropInModal(crop.id, e);
+      btnRej.onclick = (e) => rejectCropInModal(crop.id, e);
+    }
+
+    function clearZoomPanel() {
+      document.getElementById('modal-zoom-img').src = '';
+      document.getElementById('zoom-crop-zone').textContent = '--';
+      document.getElementById('zoom-crop-res').textContent = '-- x -- px';
+      document.getElementById('zoom-crop-lap').textContent = '--';
+      document.getElementById('zoom-crop-score').textContent = '--';
+      document.getElementById('zoom-crop-skin').textContent = '--';
+      document.getElementById('zoom-crop-status-text').textContent = '--';
     }
 
     // Modal Crop Actions
@@ -1416,9 +1777,17 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const res = await fetch(`/api/verify/${cropId}`, { method: 'POST' });
         const data = await res.json();
         if (data.success) {
-          const card = document.getElementById(`modal-crop-${cropId}`);
-          if (card) {
-            card.className = 'card verified';
+          const crop = currentModalCrops.find(c => c.id === cropId);
+          if (crop) crop.status = 'verified';
+
+          const row = document.getElementById(`modal-crop-row-${cropId}`);
+          if (row) {
+            row.className = 'crop-list-row verified' + (currentActiveCropId === cropId ? ' selected' : '');
+            const indicator = row.querySelector('.crop-status-indicator');
+            if (indicator) indicator.className = 'crop-status-indicator verified';
+          }
+          if (currentActiveCropId === cropId && crop) {
+            updateZoomPanel(crop);
           }
         }
       } catch (err) {
@@ -1436,9 +1805,17 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.success) {
-          const card = document.getElementById(`modal-crop-${cropId}`);
-          if (card) {
-            card.className = 'card rejected';
+          const crop = currentModalCrops.find(c => c.id === cropId);
+          if (crop) crop.status = 'rejected';
+
+          const row = document.getElementById(`modal-crop-row-${cropId}`);
+          if (row) {
+            row.className = 'crop-list-row rejected' + (currentActiveCropId === cropId ? ' selected' : '');
+            const indicator = row.querySelector('.crop-status-indicator');
+            if (indicator) indicator.className = 'crop-status-indicator rejected';
+          }
+          if (currentActiveCropId === cropId && crop) {
+            updateZoomPanel(crop);
           }
         }
       } catch (err) {
@@ -1451,12 +1828,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     document.getElementById('btn-approve-all-crops').addEventListener('click', async () => {
-      const cards = document.querySelectorAll('#modal-crops-container .card');
-      for (const card of cards) {
-        const cid = card.id.replace('modal-crop-', '');
-        await fetch(`/api/verify/${cid}`, { method: 'POST' });
-        card.className = 'card verified';
+      for (const crop of currentModalCrops) {
+        await fetch(`/api/verify/${crop.id}`, { method: 'POST' });
+        crop.status = 'verified';
+        const row = document.getElementById(`modal-crop-row-${crop.id}`);
+        if (row) {
+          row.className = 'crop-list-row verified' + (currentActiveCropId === crop.id ? ' selected' : '');
+          const indicator = row.querySelector('.crop-status-indicator');
+          if (indicator) indicator.className = 'crop-status-indicator verified';
+        }
       }
+      const activeCrop = currentModalCrops.find(c => c.id === currentActiveCropId);
+      if (activeCrop) updateZoomPanel(activeCrop);
     });
 
     // Load Snapshots for Atlas Grid
@@ -1894,6 +2277,38 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
+    const mStatusSelect = document.getElementById('master-status-select');
+    if (mStatusSelect) {
+      mStatusSelect.addEventListener('change', (e) => {
+        currentMasterStatus = e.target.value;
+        currentMasterPage = 1;
+        loadMasterSnapshots();
+      });
+    }
+
+    const btnRejMasterModal = document.getElementById('btn-reject-master-modal');
+    if (btnRejMasterModal) {
+      btnRejMasterModal.addEventListener('click', async () => {
+        if (!currentActiveMasterId) return;
+        const reason = prompt("¿Motivo para descartar esta foto maestra y todos sus recortes derivados?", "Outro publicitario / Texto / No apto para aprendizaje");
+        if (reason === null) return;
+        try {
+          const res = await fetch(`/api/master/${currentActiveMasterId}/reject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note: reason })
+          });
+          const data = await res.json();
+          if (data.success) {
+            document.getElementById('master-crop-modal').classList.remove('active');
+            loadMasterSnapshots();
+          }
+        } catch (err) {
+          console.error("Error rejecting master in modal:", err);
+        }
+      });
+    }
+
     const btnMPrev = document.getElementById('btn-master-prev');
     if (btnMPrev) {
       btnMPrev.addEventListener('click', () => {
@@ -1940,6 +2355,7 @@ def create_app(db_path: Path) -> web.Application:
     app.router.add_get("/api/models", studio.get_models)
     app.router.add_get("/api/masters", studio.get_master_snapshots)
     app.router.add_get("/api/master/{id}/crops", studio.get_master_crops)
+    app.router.add_post("/api/master/{id}/reject", studio.reject_master_snapshot)
     app.router.add_get("/api/snapshots", studio.get_snapshots)
     app.router.add_get("/api/image/{id}", studio.get_image)
     app.router.add_post("/api/verify/{id}", studio.verify_snapshot)
