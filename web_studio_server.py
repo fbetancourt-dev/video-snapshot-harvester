@@ -211,6 +211,66 @@ class WebStudioApp:
         memories = self.db_manager.get_feedback_memory(model_name=model, zone_type=zone)
         return web.json_response({"memories": memories, "count": len(memories)})
 
+    async def get_sources(self, request: web.Request) -> web.Response:
+        model = request.query.get("model", "all")
+        source_type = request.query.get("type", "all")
+        search = request.query.get("search", "").strip().lower()
+
+        def _fetch_sources():
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                sql = """
+                    SELECT 
+                        s.source_video,
+                        s.model_name,
+                        s.source_video_path,
+                        COUNT(CASE WHEN s.is_master_snapshot=1 OR s.parent_snapshot_id IS NULL THEN 1 END) as frame_count,
+                        COUNT(CASE WHEN s.is_master_snapshot=0 AND s.parent_snapshot_id IS NOT NULL THEN 1 END) as crops_count,
+                        MIN(s.id) as first_id,
+                        (SELECT s2.id FROM snapshots s2 
+                         WHERE s2.source_video = s.source_video 
+                           AND (s2.is_master_snapshot=1 OR s2.parent_snapshot_id IS NULL) 
+                         ORDER BY s2.studio_score DESC, s2.sharpness DESC LIMIT 1) as cover_id,
+                        MAX(s.created_at) as latest_created
+                    FROM snapshots s
+                    WHERE s.source_video IS NOT NULL AND s.source_video != ''
+                """
+                params = []
+                if model != "all":
+                    sql += " AND s.model_name=?"
+                    params.append(model)
+                if search:
+                    sql += " AND (LOWER(s.source_video) LIKE ? OR LOWER(s.model_name) LIKE ?)"
+                    params.extend([f"%{search}%", f"%{search}%"])
+
+                sql += """
+                    GROUP BY s.source_video, s.model_name
+                    ORDER BY latest_created DESC, frame_count DESC
+                """
+                c.execute(sql, tuple(params))
+                raw_sources = [dict(r) for r in c.fetchall()]
+
+                video_exts = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+                results = []
+                for row in raw_sources:
+                    s_name = row["source_video"]
+                    ext = Path(s_name).suffix.lower()
+                    is_video = ext in video_exts
+                    stype = "video" if is_video else "gallery"
+
+                    if source_type != "all" and stype != source_type:
+                        continue
+
+                    row["source_type"] = stype
+                    row["exists"] = Path(row["source_video_path"]).is_file() if row.get("source_video_path") else False
+                    results.append(row)
+
+                return results
+
+        sources = await asyncio.to_thread(_fetch_sources)
+        return web.json_response({"sources": sources, "total": len(sources)})
+
     async def get_master_snapshots(self, request: web.Request) -> web.Response:
         model = request.query.get("model", "all")
         video = request.query.get("video", "all")
@@ -223,7 +283,7 @@ class WebStudioApp:
             with sqlite3.connect(str(self.db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 c = conn.cursor()
-                base_cond = "(is_master_snapshot=1 OR zone_type='cuerpo' OR zone_type='master_frame')"
+                base_cond = "(is_master_snapshot=1 OR zone_type='cuerpo' OR zone_type='master_frame' OR (parent_snapshot_id IS NULL AND source_video NOT LIKE '%.mp4' AND source_video NOT LIKE '%.mkv' AND source_video NOT LIKE '%.mov' AND source_video NOT LIKE '%.webm'))"
                 params = []
                 if model != "all":
                     base_cond += " AND model_name=?"
@@ -1354,7 +1414,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="tabs-nav">
-      <button class="tab-btn active" data-tab="tab-masters">🖼️ Snapshots Maestros & Recortes</button>
+      <button class="tab-btn active" data-tab="tab-masters">🎬 Fuentes: Videos & Galerías</button>
       <button class="tab-btn" data-tab="tab-atlas">✂️ Triage por Zonas (32 Zonas)</button>
       <button class="tab-btn" data-tab="tab-video">🎬 Videos & Timeline</button>
       <button class="tab-btn" data-tab="tab-search">🔍 Buscador Contextual</button>
@@ -1369,7 +1429,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="main-container">
 
-    <!-- TAB 0: SNAPSHOTS MAESTROS ORIGINALES Y RECORTES JERÁRQUICOS -->
+    <!-- TAB 0: CATÁLOGO DE FUENTES: VIDEOS Y GALERÍAS CON MUESTREO INTER-FOTOGRAMAS -->
     <div id="tab-masters" class="tab-pane active">
       <div class="filter-bar">
         <div class="form-group">
@@ -1378,27 +1438,24 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <option value="all">Todos los Modelos</option>
           </select>
         </div>
-        <div class="form-group" style="flex: 1; max-width: 320px;">
-          <label for="master-video-select">Video Fuente</label>
-          <select id="master-video-select">
-            <option value="all">Todos los Videos</option>
-          </select>
-        </div>
         <div class="form-group">
-          <label for="master-status-select">Estado de Inspección</label>
-          <select id="master-status-select">
-            <option value="all">Todos los Estados</option>
-            <option value="pending">Pendientes de Revisión ⏳</option>
-            <option value="verified">Verificados ✅</option>
-            <option value="rejected">Descartados ❌</option>
+          <label for="master-source-type">Tipo de Fuente</label>
+          <select id="master-source-type">
+            <option value="all">Todas (Videos & Galerías)</option>
+            <option value="video">🎬 Videos</option>
+            <option value="gallery">🖼️ Galerías</option>
           </select>
         </div>
-        <div id="master-stat-count" class="status-indicator">Cargando snapshots maestros...</div>
+        <div class="form-group" style="flex: 1; max-width: 320px;">
+          <label for="master-search-input">Búsqueda rápida</label>
+          <input type="text" id="master-search-input" placeholder="Buscar por nombre de archivo o modelo...">
+        </div>
+        <div id="master-stat-count" class="status-indicator">Cargando catálogo de fuentes...</div>
       </div>
 
       <div id="masters-grid" class="grid"></div>
 
-      <div class="pagination">
+      <div class="pagination" id="masters-pagination" style="display: none;">
         <button id="btn-master-prev" class="btn">◀ Anterior</button>
         <span id="master-page-num" style="color: var(--text-muted); font-size: 0.9rem;">Página 1</span>
         <button id="btn-master-next" class="btn">Siguiente ▶</button>
@@ -1734,9 +1791,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
     // State
     let currentMasterModel = "all";
-    let currentMasterVideo = "all";
-    let currentMasterStatus = "all";
-    let currentMasterPage = 1;
+    let currentMasterSourceType = "all";
+    let currentMasterSearch = "";
     let currentActiveMasterId = null;
 
     let currentModel = "all";
@@ -1756,7 +1812,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById(tabId).classList.add('active');
 
         if (tabId === 'tab-masters') {
-          loadMasterSnapshots();
+          loadMasterSources();
         } else if (tabId === 'tab-atlas') {
           loadSnapshots();
         } else if (tabId === 'tab-video') {
@@ -1828,70 +1884,65 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    // Load Master Snapshots
-    async function loadMasterSnapshots() {
+    // Load Sources (Videos & Galleries) with Inter-Frame Sampling
+    async function loadMasterSources() {
       const grid = document.getElementById('masters-grid');
       const statBox = document.getElementById('master-stat-count');
-      grid.innerHTML = '<div style="color: var(--text-muted); padding: 2rem;">Cargando snapshots maestros...</div>';
+      grid.innerHTML = '<div style="color: var(--text-muted); padding: 2rem;">Cargando catálogo de fuentes...</div>';
 
       try {
-        let url = `/api/masters?model=${encodeURIComponent(currentMasterModel)}&status=${encodeURIComponent(currentMasterStatus)}&page=${currentMasterPage}&limit=24`;
-        if (currentMasterVideo && currentMasterVideo !== 'all') {
-          url += `&video=${encodeURIComponent(currentMasterVideo)}`;
-        }
+        let url = `/api/sources?model=${encodeURIComponent(currentMasterModel)}&type=${encodeURIComponent(currentMasterSourceType)}&search=${encodeURIComponent(currentMasterSearch)}`;
         const res = await fetch(url);
         const data = await res.json();
+        const sources = data.sources || [];
 
-        statBox.textContent = `Total: ${data.total} fotos originales | Pág ${data.page}/${data.pages}`;
-        document.getElementById('master-page-num').textContent = `Página ${data.page} de ${data.pages}`;
+        const totalVideos = sources.filter(s => s.source_type === 'video').length;
+        const totalGalleries = sources.filter(s => s.source_type === 'gallery').length;
+        statBox.textContent = `Total: ${sources.length} fuentes (${totalVideos} videos, ${totalGalleries} galerías)`;
 
         grid.innerHTML = '';
-        if (!data.masters || data.masters.length === 0) {
-          grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; padding: 3rem; text-align: center;">No hay snapshots maestros para este filtro.</div>';
+        if (sources.length === 0) {
+          grid.innerHTML = '<div style="color: var(--text-muted); grid-column: 1/-1; padding: 3rem; text-align: center;">No hay fuentes para este filtro.</div>';
           return;
         }
 
-        data.masters.forEach(item => {
-          const isRej = item.status === 'rejected';
-          const isVer = item.status === 'verified';
+        sources.forEach(src => {
+          const isVideo = src.source_type === 'video';
           const card = document.createElement('div');
-          card.className = `card ${item.status || 'pending'}`;
-          if (isRej) card.style.opacity = '0.65';
-          card.id = `master-card-${item.id}`;
+          card.className = 'card pending';
+          card.id = `source-card-${src.cover_id || src.first_id}`;
 
-          const statusBadge = isRej
-            ? '<span class="score-badge" style="background: rgba(239, 68, 68, 0.9); color: white;">✕ Descartada</span>'
-            : (isVer
-              ? '<span class="score-badge" style="background: rgba(16, 185, 129, 0.9); color: white;">✔ Verificada</span>'
-              : `<span class="score-badge">★ ${(item.studio_score || 0).toFixed(1)}</span>`);
+          const typeBadge = isVideo
+            ? `<span class="zone-badge" style="background: rgba(14, 165, 233, 0.95); font-weight: 700; font-size: 0.75rem; letter-spacing: 0.5px;">🎬 Video</span>`
+            : `<span class="zone-badge" style="background: rgba(168, 85, 247, 0.95); font-weight: 700; font-size: 0.75rem; letter-spacing: 0.5px;">🖼️ Galería</span>`;
+
+          const targetSnapId = src.cover_id || src.first_id;
 
           card.innerHTML = `
-            <div class="card-img-wrapper" style="cursor: pointer;" onclick="inspectMasterSnapshot(${item.id})">
-              <img class="card-img" src="/api/image/${item.id}" alt="${item.image_filename}">
-              <span class="zone-badge" style="background: rgba(14, 165, 233, 0.85);">📸 ${item.timestamp_str || 'Escena'}</span>
-              ${statusBadge}
+            <div class="card-img-wrapper" style="cursor: pointer;" onclick="inspectMasterSnapshot(${targetSnapId})">
+              <img class="card-img" src="/api/image/${targetSnapId}" alt="${src.source_video}">
+              ${typeBadge}
+              <span class="score-badge" style="background: rgba(15, 23, 42, 0.9); font-weight: 600;">🎞️ ${src.frame_count} ${isVideo ? 'fotogramas' : 'fotos'}</span>
             </div>
             <div class="card-body">
-              <div class="card-title" style="cursor: pointer;" onclick="inspectMasterSnapshot(${item.id})">
-                <span>${item.model_name}</span>
-                <span class="card-meta">Laplacian: ${(item.sharpness || 0).toFixed(1)}</span>
+              <div class="card-title" style="cursor: pointer;" onclick="inspectMasterSnapshot(${targetSnapId})">
+                <span style="color: #60a5fa; font-weight: 600;">${src.model_name}</span>
+                <span class="card-meta" style="color: #34d399; font-weight: 600;">✂️ ${src.crops_count} recortes</span>
               </div>
-              <p class="card-desc" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${item.source_video || 'Video'}</p>
-              ${item.review_note ? `<div style="font-size: 0.7rem; color: #ef4444; margin-top: 0.2rem; font-style: italic;">Motivo: ${item.review_note}</div>` : ''}
-              <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.4rem;">
-                <span style="font-size: 0.8rem; color: #38bdf8; font-weight: 600;">✂️ ${item.crops_count || 0} recortes</span>
-                <div style="display: flex; gap: 0.35rem;">
-                  <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;" onclick="inspectMasterSnapshot(${item.id})">🔍 Inspeccionar</button>
-                  ${!isRej ? `<button class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; background: #dc2626; border-color: #ef4444;" onclick="quickRejectMaster(${item.id}, event)" title="Descartar foto maestra y todos sus recortes">✕ Descartar</button>` : ''}
-                </div>
+              <p class="card-desc" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 0.82rem; margin-top: 0.2rem;" title="${src.source_video}">${src.source_video}</p>
+              <div style="margin-top: 0.6rem; display: flex; justify-content: space-between; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.72rem; color: #64748b;">Muestreo inter-frame</span>
+                <button class="btn btn-primary" style="padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; display: flex; align-items: center; gap: 0.35rem;" onclick="inspectMasterSnapshot(${targetSnapId})">
+                  🔍 Abrir Estudio
+                </button>
               </div>
             </div>
           `;
           grid.appendChild(card);
         });
       } catch (err) {
-        console.error("Error loading master snapshots:", err);
-        grid.innerHTML = `<div style="color: var(--danger); padding: 2rem;">Error cargando snapshots maestros: ${err.message}</div>`;
+        console.error("Error loading sources:", err);
+        grid.innerHTML = `<div style="color: var(--danger); padding: 2rem;">Error cargando fuentes: ${err.message}</div>`;
       }
     }
 
@@ -2008,8 +2059,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             countEl.textContent = Math.max(0, cur - 1);
           }
 
-          if (typeof loadMasterSnapshots === 'function') {
-            loadMasterSnapshots();
+          if (typeof loadMasterSources === 'function') {
+            loadMasterSources();
           }
         }
       } catch (err) {
@@ -2900,30 +2951,29 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     const mModelSelect = document.getElementById('master-model-select');
     if (mModelSelect) {
-      mModelSelect.addEventListener('change', async (e) => {
+      mModelSelect.addEventListener('change', (e) => {
         currentMasterModel = e.target.value;
-        currentMasterVideo = "all";
-        currentMasterPage = 1;
-        await populateMasterVideoSelect();
-        loadMasterSnapshots();
+        loadMasterSources();
       });
     }
 
-    const mVideoSelect = document.getElementById('master-video-select');
-    if (mVideoSelect) {
-      mVideoSelect.addEventListener('change', (e) => {
-        currentMasterVideo = e.target.value;
-        currentMasterPage = 1;
-        loadMasterSnapshots();
+    const mSourceType = document.getElementById('master-source-type');
+    if (mSourceType) {
+      mSourceType.addEventListener('change', (e) => {
+        currentMasterSourceType = e.target.value;
+        loadMasterSources();
       });
     }
 
-    const mStatusSelect = document.getElementById('master-status-select');
-    if (mStatusSelect) {
-      mStatusSelect.addEventListener('change', (e) => {
-        currentMasterStatus = e.target.value;
-        currentMasterPage = 1;
-        loadMasterSnapshots();
+    const mSearchInput = document.getElementById('master-search-input');
+    if (mSearchInput) {
+      let debounceTimer = null;
+      mSearchInput.addEventListener('input', (e) => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          currentMasterSearch = e.target.value.trim();
+          loadMasterSources();
+        }, 250);
       });
     }
 
@@ -2941,34 +2991,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
-    const btnMPrev = document.getElementById('btn-master-prev');
-    if (btnMPrev) {
-      btnMPrev.addEventListener('click', () => {
-        if (currentMasterPage > 1) {
-          currentMasterPage--;
-          loadMasterSnapshots();
-        }
-      });
-    }
-
-    const btnMNext = document.getElementById('btn-master-next');
-    if (btnMNext) {
-      btnMNext.addEventListener('click', () => {
-        currentMasterPage++;
-        loadMasterSnapshots();
-      });
-    }
-
     document.getElementById('btn-refresh').addEventListener('click', () => {
       loadModels();
-      loadMasterSnapshots();
+      loadMasterSources();
       loadSnapshots();
     });
 
     // Init
     setupBoundingBoxInteractivity();
     loadModels().then(() => {
-      loadMasterSnapshots();
+      loadMasterSources();
       loadSnapshots();
     });
   </script>
@@ -2986,6 +3018,7 @@ def create_app(db_path: Path) -> web.Application:
 
     # REST APIs: Models & Snapshots Triage
     app.router.add_get("/api/models", studio.get_models)
+    app.router.add_get("/api/sources", studio.get_sources)
     app.router.add_get("/api/masters", studio.get_master_snapshots)
     app.router.add_get("/api/master/{id}/crops", studio.get_master_crops)
     app.router.add_post("/api/master/{id}/reject", studio.reject_master_snapshot)
