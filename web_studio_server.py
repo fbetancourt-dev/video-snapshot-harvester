@@ -2299,8 +2299,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           return;
         }
 
-        const d = data.data;
-        const crop = currentModalCrops.find(c => c.id === currentActiveCropId);
+        const d = data.crop || data.data;
+        if (!d) {
+          alert("Error: formato de respuesta inesperado del servidor");
+          if (btnSave) btnSave.disabled = false;
+          return;
+        }
         if (crop) {
           crop.bbox = d.bbox;
           crop.sharpness = d.sharpness;
