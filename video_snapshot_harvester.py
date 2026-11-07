@@ -2107,9 +2107,23 @@ class GoogleDriveSource:
             return local_path
 
         print(f"  ☁️ Descargando desde Google Drive ({remote_name}): {filename}...")
-        cmd = ["rclone", "copyto", remote_path, str(local_path)]
+        cmd = [
+            "rclone",
+            "copyto",
+            remote_path,
+            str(local_path),
+            "--drive-chunk-size", "64M",
+            "--buffer-size", "32M",
+            "--drive-pacer-min-sleep", "10ms",
+            "--drive-pacer-burst", "200",
+            "--no-traverse",
+            "--timeout", "120s",
+            "--contimeout", "20s",
+            "--retries", "5",
+            "--low-level-retries", "10"
+        ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if res.returncode == 0 and local_path.is_file():
                 mb = local_path.stat().st_size / (1024 * 1024)
                 print(f"  ✅ Descargado en staging: {local_path.name} ({mb:.1f} MB)")
