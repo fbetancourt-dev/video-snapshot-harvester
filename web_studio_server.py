@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+from collections import OrderedDict
 
 from aiohttp import web
 
@@ -92,6 +93,18 @@ class WebStudioApp:
         self.db_manager = SnapshotDatabaseManager(self.db_path)
         self.blob_semaphore = asyncio.Semaphore(8)
         self.bbox_cache: Dict[int, Dict[str, Any]] = {}
+        self.master_img_cache: OrderedDict[str, Any] = OrderedDict()
+
+    def _get_master_image(self, master_path: str) -> Optional[np.ndarray]:
+        if master_path in self.master_img_cache:
+            self.master_img_cache.move_to_end(master_path)
+            return self.master_img_cache[master_path]
+        img = cv2.imread(master_path)
+        if img is not None:
+            if len(self.master_img_cache) >= 16:
+                self.master_img_cache.popitem(last=False)
+            self.master_img_cache[master_path] = img
+        return img
 
     async def get_models(self, request: web.Request) -> web.Response:
         models = await asyncio.to_thread(self.db_manager.get_models_summary)
@@ -200,6 +213,7 @@ class WebStudioApp:
 
     async def get_master_snapshots(self, request: web.Request) -> web.Response:
         model = request.query.get("model", "all")
+        video = request.query.get("video", "all")
         status = request.query.get("status", "all")
         page = max(1, int(request.query.get("page", 1)))
         limit = max(1, min(100, int(request.query.get("limit", 24))))
@@ -214,6 +228,9 @@ class WebStudioApp:
                 if model != "all":
                     base_cond += " AND model_name=?"
                     params.append(model)
+                if video != "all":
+                    base_cond += " AND source_video=?"
+                    params.append(video)
                 if status != "all":
                     base_cond += " AND status=?"
                     params.append(status)
@@ -221,13 +238,15 @@ class WebStudioApp:
                 c.execute(f"SELECT COUNT(*) FROM snapshots WHERE {base_cond}", tuple(params))
                 total = c.fetchone()[0]
 
+                order_clause = "ORDER BY s.timestamp_sec ASC" if video != "all" else "ORDER BY s.id DESC"
+
                 sql = f"""
-                    SELECT s.id, s.model_name, s.image_filename, s.source_video, s.timestamp_str,
+                    SELECT s.id, s.model_name, s.image_filename, s.source_video, s.timestamp_str, s.timestamp_sec,
                            s.studio_score, s.sharpness, s.status, s.review_note, s.created_at,
                            (SELECT COUNT(*) FROM snapshots c WHERE c.parent_snapshot_id = s.id) as crops_count
                     FROM snapshots s
                     WHERE {base_cond}
-                    ORDER BY s.id DESC
+                    {order_clause}
                     LIMIT ? OFFSET ?
                 """
                 c.execute(sql, tuple(params + [limit, offset]))
@@ -273,6 +292,139 @@ class WebStudioApp:
         await asyncio.to_thread(_do_reject)
         return web.json_response({"success": True, "master_id": master_id, "status": "rejected"})
 
+    async def reposition_crop(self, request: web.Request) -> web.Response:
+        crop_id = int(request.match_info["id"])
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body"}, status=400)
+
+        rel_x = float(body.get("rel_x", 0.0))
+        rel_y = float(body.get("rel_y", 0.0))
+        rel_w = float(body.get("rel_w", 0.0))
+        rel_h = float(body.get("rel_h", 0.0))
+
+        def _do_reposition():
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("""
+                    SELECT c.id, c.image_path, c.parent_snapshot_id, c.zone_type,
+                           m.image_path as master_image_path
+                    FROM snapshots c
+                    LEFT JOIN snapshots m ON c.parent_snapshot_id = m.id
+                    WHERE c.id=?
+                """, (crop_id,))
+                row = c.fetchone()
+                if not row:
+                    return None, "Crop not found"
+
+                crop_info = dict(row)
+                master_path = crop_info.get("master_image_path")
+                crop_path = crop_info.get("image_path")
+
+                if not master_path or not os.path.exists(master_path):
+                    return None, f"Master image not found at {master_path}"
+
+                m_img = self._get_master_image(master_path)
+                if m_img is None:
+                    return None, "Failed to load master image"
+
+                H, W = m_img.shape[:2]
+                # Coordenadas relativas desnormalizadas con alineación a enteros pares (& ~1)
+                x1 = max(0, min(W - 16, int(round(rel_x * W)))) & ~1
+                y1 = max(0, min(H - 16, int(round(rel_y * H)))) & ~1
+                w = max(16, min(W - x1, int(round(rel_w * W)))) & ~1
+                h = max(16, min(H - y1, int(round(rel_h * H)))) & ~1
+                x2 = min(W, x1 + w)
+                y2 = min(H, y1 + h)
+
+                new_crop_img = m_img[y1:y2, x1:x2]
+                if new_crop_img.size == 0:
+                    return None, "Invalid crop region"
+
+                gray = cv2.cvtColor(new_crop_img, cv2.COLOR_BGR2GRAY)
+                lap = round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2)
+                bright = round(float(np.mean(gray)), 2)
+
+                if crop_path:
+                    Path(crop_path).parent.mkdir(parents=True, exist_ok=True)
+                    ok, buf = cv2.imencode(".jpg", new_crop_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if ok:
+                        tmp_crop_path = crop_path + ".tmp"
+                        with open(tmp_crop_path, "wb") as f:
+                            f.write(buf)
+                        os.replace(tmp_crop_path, crop_path) # Publicación atómica POSIX
+
+                box_info = {
+                    "x": x1,
+                    "y": y1,
+                    "w": w,
+                    "h": h,
+                    "rel_x": round(float(x1) / W, 4),
+                    "rel_y": round(float(y1) / H, 4),
+                    "rel_w": round(float(w) / W, 4),
+                    "rel_h": round(float(h) / H, 4),
+                    "manually_adjusted": True,
+                    "adjusted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                }
+                box_json_str = json.dumps(box_info)
+
+                c.execute("SELECT biometric_json, model_name, zone_type FROM snapshots WHERE id=?", (crop_id,))
+                b_row = c.fetchone()
+                b_data = {}
+                m_name = "unknown"
+                z_name = crop_info.get("zone_type", "desconocida")
+                if b_row:
+                    if b_row[0]:
+                        try:
+                            b_data = json.loads(b_row[0])
+                        except Exception:
+                            b_data = {}
+                    if b_row[1]:
+                        m_name = b_row[1]
+                    if b_row[2]:
+                        z_name = b_row[2]
+
+                b_data["bbox"] = box_info
+                b_data["manual_correction"] = True
+                new_b_json = json.dumps(b_data)
+
+                c.execute("""
+                    UPDATE snapshots
+                    SET sharpness=?, brightness=?, status='verified',
+                        review_note='Ajuste manual de recorte de coordenadas por el usuario',
+                        crop_bbox_json=?, biometric_json=?
+                    WHERE id=?
+                """, (lap, bright, box_json_str, new_b_json, crop_id))
+
+                c.execute("""
+                    INSERT INTO agy_feedback_memory (snapshot_id, model_name, zone_type, error_category, user_note)
+                    VALUES (?, ?, ?, 'Ajuste manual de coordenadas', ?)
+                """, (crop_id, m_name, z_name, f"El usuario reubicó el recorte '{z_name}' a coords [x={x1}, y={y1}, w={w}, h={h}]"))
+                conn.commit()
+
+                self.bbox_cache[crop_id] = {
+                    "bbox": box_info,
+                    "crop_width": w,
+                    "crop_height": h
+                }
+
+                return {
+                    "id": crop_id,
+                    "sharpness": lap,
+                    "brightness": bright,
+                    "crop_width": w,
+                    "crop_height": h,
+                    "bbox": box_info,
+                    "status": "verified"
+                }, None
+
+        res, err = await asyncio.to_thread(_do_reposition)
+        if err:
+            return web.json_response({"success": False, "error": err}, status=400)
+        return web.json_response({"success": True, "crop": res})
+
     async def get_master_crops(self, request: web.Request) -> web.Response:
         master_id = int(request.match_info["id"])
 
@@ -288,7 +440,7 @@ class WebStudioApp:
 
                 # Child crops: matched by parent_snapshot_id OR same video & near timestamp
                 c.execute("""
-                    SELECT id, model_name, image_filename, image_path, zone_type, studio_score, sharpness, status, review_note, description, skin_tone_hex
+                    SELECT id, model_name, image_filename, image_path, zone_type, studio_score, sharpness, status, review_note, description, skin_tone_hex, crop_bbox_json
                     FROM snapshots
                     WHERE parent_snapshot_id=? OR (parent_snapshot_id IS NULL AND source_video=? AND ABS(timestamp_sec - ?) < 0.2 AND id != ?)
                     ORDER BY id ASC
@@ -306,6 +458,21 @@ class WebStudioApp:
 
                         for crop in crops:
                             cid = crop["id"]
+                            if crop.get("crop_bbox_json"):
+                                try:
+                                    saved_box = json.loads(crop["crop_bbox_json"])
+                                    crop["bbox"] = saved_box
+                                    crop["crop_width"] = saved_box.get("w")
+                                    crop["crop_height"] = saved_box.get("h")
+                                    self.bbox_cache[cid] = {
+                                        "bbox": saved_box,
+                                        "crop_width": saved_box.get("w"),
+                                        "crop_height": saved_box.get("h")
+                                    }
+                                    continue
+                                except Exception:
+                                    pass
+
                             if cid in self.bbox_cache:
                                 cached = self.bbox_cache[cid]
                                 crop["bbox"] = cached["bbox"]
@@ -1057,14 +1224,35 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     #crop-highlight-box {
       position: absolute;
       display: none;
-      pointer-events: none;
+      pointer-events: auto;
       border: 2.5px solid #38bdf8;
       box-shadow: 0 0 14px rgba(56, 189, 248, 0.9), inset 0 0 10px rgba(56, 189, 248, 0.35);
       background: rgba(56, 189, 248, 0.18);
       border-radius: 4px;
-      transition: all 0.12s cubic-bezier(0.4, 0, 0.2, 1);
       z-index: 10;
+      cursor: move;
+      user-select: none;
+      box-sizing: border-box;
     }
+    #crop-highlight-box.dragging {
+      cursor: grabbing;
+      border-color: #10b981;
+      box-shadow: 0 0 18px rgba(16, 185, 129, 0.95);
+    }
+    .crop-resizer {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: #38bdf8;
+      border: 1.5px solid #ffffff;
+      border-radius: 2px;
+      z-index: 12;
+    }
+    .crop-resizer.nw { top: -5px; left: -5px; cursor: nw-resize; }
+    .crop-resizer.ne { top: -5px; right: -5px; cursor: ne-resize; }
+    .crop-resizer.se { bottom: -5px; right: -5px; cursor: se-resize; }
+    .crop-resizer.sw { bottom: -5px; left: -5px; cursor: sw-resize; }
+
     #crop-highlight-label {
       position: absolute;
       top: -24px;
@@ -1079,6 +1267,67 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       box-shadow: 0 2px 6px rgba(0,0,0,0.5);
       text-transform: uppercase;
       letter-spacing: 0.5px;
+      pointer-events: none;
+    }
+
+    /* Filmstrip item in modal */
+    .filmstrip-card {
+      position: relative;
+      width: 76px;
+      height: 52px;
+      min-width: 76px;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 2px solid #334155;
+      cursor: pointer;
+      background: #020617;
+      transition: all 0.15s ease;
+    }
+    .filmstrip-card:hover {
+      border-color: #64748b;
+      transform: translateY(-2px);
+    }
+    .filmstrip-card.active {
+      border-color: #38bdf8 !important;
+      box-shadow: 0 0 10px rgba(56, 189, 248, 0.7);
+    }
+    .filmstrip-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .filmstrip-time {
+      position: absolute;
+      bottom: 2px;
+      left: 2px;
+      background: rgba(0, 0, 0, 0.75);
+      color: #38bdf8;
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 3px;
+      border-radius: 2px;
+      pointer-events: none;
+    }
+    .filmstrip-del-btn {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      background: rgba(220, 38, 38, 0.85);
+      color: white;
+      border: none;
+      border-radius: 3px;
+      width: 18px;
+      height: 18px;
+      font-size: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .filmstrip-del-btn:hover {
+      background: #ef4444;
     }
 
     /* Pagination */
@@ -1121,6 +1370,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           <label for="master-model-select">Modelo Biométrico</label>
           <select id="master-model-select">
             <option value="all">Todos los Modelos</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex: 1; max-width: 320px;">
+          <label for="master-video-select">Video Fuente</label>
+          <select id="master-video-select">
+            <option value="all">Todos los Videos</option>
           </select>
         </div>
         <div class="form-group">
@@ -1361,31 +1616,45 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <span id="modal-master-sharpness" style="font-size: 0.75rem; color: #38bdf8;">Nitidez: --</span>
           </div>
 
-          <!-- Contenedor Maestro con Bounding Box Interactivo -->
-          <div style="flex: 1.2; min-height: 250px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #020617; border-radius: 6px; padding: 4px; position: relative;">
+          <!-- Contenedor Maestro con Bounding Box Interactivo (Movible y Redimensionable) -->
+          <div style="flex: 1.2; min-height: 240px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #020617; border-radius: 6px; padding: 4px; position: relative;">
             <div id="master-img-wrapper" style="position: relative; display: inline-block; line-height: 0; max-width: 100%; max-height: 100%;">
-              <img id="modal-master-img" src="" alt="Snapshot Original" style="max-width: 100%; max-height: 380px; width: auto; height: auto; display: block; border-radius: 4px; object-fit: contain;">
+              <img id="modal-master-img" src="" alt="Snapshot Original" style="max-width: 100%; max-height: 350px; width: auto; height: auto; display: block; border-radius: 4px; object-fit: contain;">
               <div id="crop-highlight-box">
                 <span id="crop-highlight-label"></span>
+                <div class="crop-resizer nw" data-dir="nw"></div>
+                <div class="crop-resizer ne" data-dir="ne"></div>
+                <div class="crop-resizer se" data-dir="se"></div>
+                <div class="crop-resizer sw" data-dir="sw"></div>
               </div>
             </div>
           </div>
-          <div id="modal-master-desc" style="font-size: 0.72rem; color: #94a3b8; margin-top: 0.4rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+          <div id="modal-master-desc" style="font-size: 0.72rem; color: #94a3b8; margin-top: 0.3rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+
+          <!-- Tira de Selección de Fotogramas del Video (con borrado de fotogramas no deseados) -->
+          <div style="margin-top: 0.4rem; background: #030712; border: 1px solid #1e293b; border-radius: 6px; padding: 0.4rem 0.6rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+              <span style="font-size: 0.75rem; color: #94a3b8; font-weight: 600;">🎞️ Fotogramas del Video (<span id="strip-frame-count">0</span>) - Clic para cambiar frame o borra con 🗑️:</span>
+            </div>
+            <div id="modal-filmstrip-scroller" style="display: flex; gap: 0.5rem; overflow-x: auto; padding-bottom: 0.2rem; scroll-behavior: smooth;">
+              <!-- Miniaturas de fotogramas inyectadas aquí -->
+            </div>
+          </div>
 
           <!-- Recuadro con Zoom en la zona de interés recortada -->
-          <div style="margin-top: 0.6rem; background: #0a0f1d; border: 1px solid #1e293b; border-radius: 6px; padding: 0.6rem; display: flex; flex-direction: column;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+          <div style="margin-top: 0.4rem; background: #0a0f1d; border: 1px solid #1e293b; border-radius: 6px; padding: 0.5rem; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
               <span style="font-size: 0.8rem; font-weight: 600; color: #38bdf8; display: flex; align-items: center; gap: 0.4rem;">
                 🔍 Zoom & Detalle Fino: <span id="zoom-crop-zone" style="color: #f8fafc;">Selecciona un recorte</span>
               </span>
               <span id="zoom-crop-res" style="font-size: 0.75rem; color: #94a3b8; font-family: monospace;">-- x -- px</span>
             </div>
             <div style="display: flex; gap: 0.8rem; align-items: center;">
-              <div style="width: 140px; height: 140px; min-width: 140px; background: #020617; border-radius: 6px; border: 1px solid #334155; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+              <div style="width: 130px; height: 130px; min-width: 130px; background: #020617; border-radius: 6px; border: 1px solid #334155; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
                 <img id="modal-zoom-img" src="" alt="Zoom Recorte" style="max-width: 100%; max-height: 100%; object-fit: contain;">
                 <span id="zoom-badge-status" class="status-badge" style="position: absolute; top: 4px; right: 4px; font-size: 0.65rem; padding: 2px 5px;">--</span>
               </div>
-              <div style="flex: 1; display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.75rem;">
+              <div style="flex: 1; display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.75rem;">
                 <div style="display: flex; justify-content: space-between;">
                   <span style="color: #64748b;">Nitidez Local:</span>
                   <span id="zoom-crop-lap" style="color: #38bdf8; font-weight: 600;">--</span>
@@ -1402,9 +1671,10 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                   <span style="color: #64748b;">Estado:</span>
                   <span id="zoom-crop-status-text" style="color: #94a3b8; font-weight: 600;">Pendiente</span>
                 </div>
-                <div style="display: flex; gap: 0.5rem; margin-top: 0.3rem;">
-                  <button id="btn-zoom-verify" class="btn btn-sm btn-verify" style="flex: 1; padding: 0.3rem; font-size: 0.75rem;">✔ Aprobar Recorte</button>
-                  <button id="btn-zoom-reject" class="btn btn-sm btn-reject" style="flex: 1; padding: 0.3rem; font-size: 0.75rem;">✕ Descartar</button>
+                <div style="display: flex; gap: 0.4rem; margin-top: 0.2rem; flex-wrap: wrap;">
+                  <button id="btn-save-reposition" class="btn btn-sm" style="flex: 1 1 100%; background: #059669; border-color: #10b981; color: white; padding: 0.35rem; font-weight: 600; display: none;" title="Guardar nuevas coordenadas en SQL y re-recortar imagen">💾 Guardar Recorte Corregido en SQL</button>
+                  <button id="btn-zoom-verify" class="btn btn-sm btn-verify" style="flex: 1; padding: 0.25rem 0.4rem; font-size: 0.72rem;">✔ Aprobar</button>
+                  <button id="btn-zoom-reject" class="btn btn-sm btn-reject" style="flex: 1; padding: 0.25rem 0.4rem; font-size: 0.72rem;">✕ Descartar</button>
                 </div>
               </div>
             </div>
@@ -1458,6 +1728,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
     // State
     let currentMasterModel = "all";
+    let currentMasterVideo = "all";
     let currentMasterStatus = "all";
     let currentMasterPage = 1;
     let currentActiveMasterId = null;
@@ -1489,6 +1760,27 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         }
       });
     });
+
+    // Populate Master Video Dropdown
+    async function populateMasterVideoSelect() {
+      const select = document.getElementById('master-video-select');
+      if (!select) return;
+      select.innerHTML = '<option value="all">Todos los Videos</option>';
+      try {
+        const url = currentMasterModel !== "all" ? `/api/videos?model=${encodeURIComponent(currentMasterModel)}` : '/api/videos';
+        const res = await fetch(url);
+        const data = await res.json();
+        const videos = data.videos || [];
+        videos.forEach(v => {
+          const opt = document.createElement('option');
+          opt.value = v.filename;
+          opt.textContent = `${v.filename} (${v.snapshots_count || v.scenes_count || 0} fotos)`;
+          select.appendChild(opt);
+        });
+      } catch (err) {
+        console.error("Error populating master videos:", err);
+      }
+    }
 
     // Load Models into Dropdowns
     async function loadModels() {
@@ -1523,6 +1815,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           opt2.textContent = m.model_name;
           searchModelSelect.appendChild(opt2);
         });
+
+        await populateMasterVideoSelect();
       } catch (err) {
         console.error("Error loading models:", err);
       }
@@ -1535,7 +1829,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       grid.innerHTML = '<div style="color: var(--text-muted); padding: 2rem;">Cargando snapshots maestros...</div>';
 
       try {
-        const res = await fetch(`/api/masters?model=${currentMasterModel}&status=${currentMasterStatus}&page=${currentMasterPage}&limit=24`);
+        let url = `/api/masters?model=${encodeURIComponent(currentMasterModel)}&status=${encodeURIComponent(currentMasterStatus)}&page=${currentMasterPage}&limit=24`;
+        if (currentMasterVideo && currentMasterVideo !== 'all') {
+          url += `&video=${encodeURIComponent(currentMasterVideo)}`;
+        }
+        const res = await fetch(url);
         const data = await res.json();
 
         statBox.textContent = `Total: ${data.total} fotos originales | Pág ${data.page}/${data.pages}`;
@@ -1612,6 +1910,106 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     let currentModalCrops = [];
     let currentActiveCropId = null;
+    let currentRelativeBbox = null; // { rel_x, rel_y, rel_w, rel_h }
+
+    // Filmstrip for current master's source video/gallery
+    async function renderModalFilmstrip(sourceVideo, activeId) {
+      const scroller = document.getElementById('modal-filmstrip-scroller');
+      const countEl = document.getElementById('strip-frame-count');
+      if (!scroller) return;
+
+      scroller.innerHTML = '<div style="color: #64748b; font-size: 0.75rem; padding: 0.5rem;">Cargando fotogramas...</div>';
+
+      try {
+        const url = sourceVideo 
+          ? `/api/masters?video=${encodeURIComponent(sourceVideo)}&limit=100`
+          : `/api/masters?limit=100`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const masters = data.masters || [];
+
+        if (countEl) countEl.textContent = masters.length;
+        scroller.innerHTML = '';
+
+        if (masters.length === 0) {
+          scroller.innerHTML = '<div style="color: #64748b; font-size: 0.75rem; padding: 0.5rem;">No se encontraron fotogramas adicionales.</div>';
+          return;
+        }
+
+        masters.forEach(item => {
+          const card = document.createElement('div');
+          card.className = `filmstrip-card ${item.id === activeId ? 'active' : ''}`;
+          card.dataset.masterId = item.id;
+          card.title = `Fotograma #${item.id} (${item.timestamp_str || ''}) - Nitidez: ${(item.sharpness || 0).toFixed(1)}`;
+
+          card.innerHTML = `
+            <img src="/api/image/${item.id}" alt="Frame #${item.id}">
+            <span class="filmstrip-time">${item.timestamp_str || '#' + item.id}</span>
+            <button class="filmstrip-del-btn" title="Descartar y borrar este fotograma defectuoso" onclick="deleteMasterSnapshot(${item.id}, event)">🗑️</button>
+          `;
+
+          card.addEventListener('click', (e) => {
+            if (e.target.classList.contains('filmstrip-del-btn')) return;
+            inspectMasterSnapshot(item.id);
+          });
+
+          scroller.appendChild(card);
+        });
+
+        setTimeout(() => {
+          const activeCard = scroller.querySelector('.filmstrip-card.active');
+          if (activeCard) {
+            activeCard.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+          }
+        }, 150);
+
+      } catch (err) {
+        console.error("Error cargando filmstrip:", err);
+        scroller.innerHTML = `<div style="color: #ef4444; font-size: 0.75rem;">Error cargando filmstrip: ${err.message}</div>`;
+      }
+    }
+
+    async function deleteMasterSnapshot(masterId, e) {
+      if (e) e.stopPropagation();
+      if (!confirm(`¿Descartar el fotograma #${masterId} y todos sus recortes anatómicos derivados?`)) {
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/master/${masterId}/reject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: 'Descarte visual de fotograma inservible desde filmstrip' })
+        });
+        const data = await res.json();
+        if (data.success) {
+          if (currentActiveMasterId === masterId) {
+            const nextCard = document.querySelector(`.filmstrip-card:not([data-master-id="${masterId}"])`);
+            if (nextCard) {
+              const nextId = parseInt(nextCard.dataset.masterId);
+              inspectMasterSnapshot(nextId);
+            } else {
+              document.getElementById('master-crop-modal').classList.remove('active');
+            }
+          }
+
+          const card = document.querySelector(`.filmstrip-card[data-master-id="${masterId}"]`);
+          if (card) card.remove();
+
+          const countEl = document.getElementById('strip-frame-count');
+          if (countEl) {
+            const cur = parseInt(countEl.textContent) || 1;
+            countEl.textContent = Math.max(0, cur - 1);
+          }
+
+          if (typeof loadMasterSnapshots === 'function') {
+            loadMasterSnapshots();
+          }
+        }
+      } catch (err) {
+        alert("Error descartando fotograma: " + err.message);
+      }
+    }
 
     // Inspect Master Snapshot & Its Derived Crops
     async function inspectMasterSnapshot(masterId) {
@@ -1619,7 +2017,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const modal = document.getElementById('master-crop-modal');
       const cropsList = document.getElementById('modal-crops-list');
       const box = document.getElementById('crop-highlight-box');
+      const btnSave = document.getElementById('btn-save-reposition');
       if (box) box.style.display = 'none';
+      if (btnSave) btnSave.style.display = 'none';
 
       cropsList.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">Cargando recortes anatómicos...</div>';
       modal.classList.add('active');
@@ -1640,6 +2040,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('modal-master-img').src = `/api/image/${m.id}`;
         document.getElementById('modal-master-desc').textContent = m.description || '';
         document.getElementById('modal-crops-count').textContent = data.crops_count;
+
+        // Render filmstrip of frames from same source
+        renderModalFilmstrip(m.source_video, m.id);
 
         cropsList.innerHTML = '';
         if (currentModalCrops.length === 0) {
@@ -1675,12 +2078,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
           `;
 
+          // Exclusivamente selección por CLICK para no mover el recuadro con hover accidental
           row.addEventListener('click', () => selectCropInModal(c.id));
-          row.addEventListener('mouseenter', () => highlightCropBox(c.id));
           cropsList.appendChild(row);
         });
 
-        // Select first crop by default (or 'cara' if present)
+        // Seleccionar primer recorte por defecto (o 'cara' si existe)
         const defaultCrop = currentModalCrops.find(cr => cr.zone_type === 'cara') || currentModalCrops[0];
         if (defaultCrop) {
           selectCropInModal(defaultCrop.id);
@@ -1696,15 +2099,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const crop = currentModalCrops.find(c => c.id === cropId);
       if (!crop) return;
 
-      // Update row selection style
       document.querySelectorAll('.crop-list-row').forEach(r => r.classList.remove('selected'));
       const activeRow = document.getElementById(`modal-crop-row-${cropId}`);
       if (activeRow) activeRow.classList.add('selected');
 
-      // Update Bounding Box on Master Image
       highlightCropBox(cropId);
-
-      // Update Zoom Preview Panel
       updateZoomPanel(crop);
     }
 
@@ -1712,9 +2111,11 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       const crop = currentModalCrops.find(c => c.id === cropId);
       const box = document.getElementById('crop-highlight-box');
       const label = document.getElementById('crop-highlight-label');
+      const btnSave = document.getElementById('btn-save-reposition');
 
       if (!crop || !crop.bbox) {
         if (box) box.style.display = 'none';
+        if (btnSave) btnSave.style.display = 'none';
         return;
       }
 
@@ -1724,9 +2125,219 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       box.style.height = `${(crop.bbox.rel_h * 100).toFixed(2)}%`;
       box.style.display = 'block';
 
+      currentRelativeBbox = {
+        rel_x: crop.bbox.rel_x,
+        rel_y: crop.bbox.rel_y,
+        rel_w: crop.bbox.rel_w,
+        rel_h: crop.bbox.rel_h
+      };
+
+      if (btnSave) {
+        btnSave.style.display = 'none';
+        btnSave.textContent = '💾 Guardar Recorte Corregido en SQL';
+        btnSave.disabled = false;
+      }
+
       const cW = crop.crop_width || crop.bbox.w;
       const cH = crop.crop_height || crop.bbox.h;
       label.textContent = `${crop.zone_type} (${cW}x${cH}px)`;
+    }
+
+    // Interactive Drag and Resize of Bounding Box
+    let isDraggingBox = false;
+    let isResizingBox = false;
+    let resizeDir = null;
+    let dragStartX = 0, dragStartY = 0;
+    let boxStartLeft = 0, boxStartTop = 0, boxStartW = 0, boxStartH = 0;
+
+    function setupBoundingBoxInteractivity() {
+      const box = document.getElementById('crop-highlight-box');
+      const img = document.getElementById('modal-master-img');
+      const btnSave = document.getElementById('btn-save-reposition');
+
+      if (!box || !img) return;
+
+      box.addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('crop-resizer')) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        isDraggingBox = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+
+        const rect = box.getBoundingClientRect();
+        const imgRect = img.getBoundingClientRect();
+
+        boxStartLeft = rect.left - imgRect.left;
+        boxStartTop = rect.top - imgRect.top;
+        boxStartW = rect.width;
+        boxStartH = rect.height;
+
+        box.classList.add('dragging');
+      });
+
+      box.querySelectorAll('.crop-resizer').forEach(resizer => {
+        resizer.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          isResizingBox = true;
+          resizeDir = resizer.dataset.dir;
+          dragStartX = e.clientX;
+          dragStartY = e.clientY;
+
+          const rect = box.getBoundingClientRect();
+          const imgRect = img.getBoundingClientRect();
+
+          boxStartLeft = rect.left - imgRect.left;
+          boxStartTop = rect.top - imgRect.top;
+          boxStartW = rect.width;
+          boxStartH = rect.height;
+        });
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!isDraggingBox && !isResizingBox) return;
+        const imgRect = img.getBoundingClientRect();
+        if (imgRect.width <= 0 || imgRect.height <= 0) return;
+
+        const dx = e.clientX - dragStartX;
+        const dy = e.clientY - dragStartY;
+
+        let newLeft = boxStartLeft;
+        let newTop = boxStartTop;
+        let newW = boxStartW;
+        let newH = boxStartH;
+
+        if (isDraggingBox) {
+          newLeft = Math.max(0, Math.min(imgRect.width - newW, boxStartLeft + dx));
+          newTop = Math.max(0, Math.min(imgRect.height - newH, boxStartTop + dy));
+        } else if (isResizingBox) {
+          const minSize = 24;
+          if (resizeDir === 'se') {
+            newW = Math.max(minSize, Math.min(imgRect.width - newLeft, boxStartW + dx));
+            newH = Math.max(minSize, Math.min(imgRect.height - newTop, boxStartH + dy));
+          } else if (resizeDir === 'sw') {
+            const rawW = boxStartW - dx;
+            if (rawW >= minSize && boxStartLeft + dx >= 0) {
+              newLeft = boxStartLeft + dx;
+              newW = rawW;
+            }
+            newH = Math.max(minSize, Math.min(imgRect.height - newTop, boxStartH + dy));
+          } else if (resizeDir === 'ne') {
+            newW = Math.max(minSize, Math.min(imgRect.width - newLeft, boxStartW + dx));
+            const rawH = boxStartH - dy;
+            if (rawH >= minSize && boxStartTop + dy >= 0) {
+              newTop = boxStartTop + dy;
+              newH = rawH;
+            }
+          } else if (resizeDir === 'nw') {
+            const rawW = boxStartW - dx;
+            if (rawW >= minSize && boxStartLeft + dx >= 0) {
+              newLeft = boxStartLeft + dx;
+              newW = rawW;
+            }
+            const rawH = boxStartH - dy;
+            if (rawH >= minSize && boxStartTop + dy >= 0) {
+              newTop = boxStartTop + dy;
+              newH = rawH;
+            }
+          }
+        }
+
+        const rel_x = newLeft / imgRect.width;
+        const rel_y = newTop / imgRect.height;
+        const rel_w = newW / imgRect.width;
+        const rel_h = newH / imgRect.height;
+
+        box.style.left = `${(rel_x * 100).toFixed(2)}%`;
+        box.style.top = `${(rel_y * 100).toFixed(2)}%`;
+        box.style.width = `${(rel_w * 100).toFixed(2)}%`;
+        box.style.height = `${(rel_h * 100).toFixed(2)}%`;
+
+        currentRelativeBbox = { rel_x, rel_y, rel_w, rel_h };
+
+        if (btnSave) {
+          btnSave.style.display = 'block';
+          btnSave.textContent = '💾 Guardar Recorte Corregido en SQL';
+          btnSave.disabled = false;
+        }
+      });
+
+      window.addEventListener('mouseup', () => {
+        if (isDraggingBox || isResizingBox) {
+          isDraggingBox = false;
+          isResizingBox = false;
+          resizeDir = null;
+          box.classList.remove('dragging');
+        }
+      });
+    }
+
+    async function saveAdjustedCropPosition() {
+      if (!currentActiveCropId || !currentRelativeBbox) {
+        alert("Selecciona un recorte y arrastra/redimensiona la caja antes de guardar.");
+        return;
+      }
+      const btnSave = document.getElementById('btn-save-reposition');
+      if (btnSave) {
+        btnSave.disabled = true;
+        btnSave.textContent = '⏳ Guardando y re-recortando con OpenCV...';
+      }
+
+      try {
+        const res = await fetch(`/api/crop/${currentActiveCropId}/reposition`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentRelativeBbox)
+        });
+        const data = await res.json();
+        if (!data.success) {
+          alert("Error: " + (data.error || 'No se pudo guardar'));
+          if (btnSave) btnSave.disabled = false;
+          return;
+        }
+
+        const d = data.data;
+        const crop = currentModalCrops.find(c => c.id === currentActiveCropId);
+        if (crop) {
+          crop.bbox = d.bbox;
+          crop.sharpness = d.sharpness;
+          crop.brightness = d.brightness;
+          crop.crop_width = d.crop_width;
+          crop.crop_height = d.crop_height;
+          crop.status = 'verified';
+        }
+
+        const cacheBuster = `?t=${Date.now()}`;
+        const zoomImg = document.getElementById('modal-zoom-img');
+        if (zoomImg) zoomImg.src = `/api/image/${currentActiveCropId}${cacheBuster}`;
+
+        const row = document.getElementById(`modal-crop-row-${currentActiveCropId}`);
+        if (row) {
+          row.className = 'crop-list-row verified selected';
+          const thumb = row.querySelector('.crop-list-thumb');
+          if (thumb) thumb.src = `/api/image/${currentActiveCropId}${cacheBuster}`;
+          const indicator = row.querySelector('.crop-status-indicator');
+          if (indicator) indicator.className = 'crop-status-indicator verified';
+          const lapEl = row.querySelector('b');
+          if (lapEl) lapEl.textContent = (d.sharpness || 0).toFixed(1);
+        }
+
+        if (crop) updateZoomPanel(crop);
+
+        if (btnSave) {
+          btnSave.textContent = '✅ Guardado en SQL exitosamente';
+          setTimeout(() => {
+            btnSave.style.display = 'none';
+            btnSave.disabled = false;
+          }, 2000);
+        }
+      } catch (err) {
+        alert("Error guardando recorte: " + err.message);
+        if (btnSave) btnSave.disabled = false;
+      }
     }
 
     function updateZoomPanel(crop) {
@@ -2270,8 +2881,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     const mModelSelect = document.getElementById('master-model-select');
     if (mModelSelect) {
-      mModelSelect.addEventListener('change', (e) => {
+      mModelSelect.addEventListener('change', async (e) => {
         currentMasterModel = e.target.value;
+        currentMasterVideo = "all";
+        currentMasterPage = 1;
+        await populateMasterVideoSelect();
+        loadMasterSnapshots();
+      });
+    }
+
+    const mVideoSelect = document.getElementById('master-video-select');
+    if (mVideoSelect) {
+      mVideoSelect.addEventListener('change', (e) => {
+        currentMasterVideo = e.target.value;
         currentMasterPage = 1;
         loadMasterSnapshots();
       });
@@ -2286,25 +2908,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
+    const btnSaveRepo = document.getElementById('btn-save-reposition');
+    if (btnSaveRepo) {
+      btnSaveRepo.addEventListener('click', saveAdjustedCropPosition);
+    }
+
     const btnRejMasterModal = document.getElementById('btn-reject-master-modal');
     if (btnRejMasterModal) {
-      btnRejMasterModal.addEventListener('click', async () => {
-        if (!currentActiveMasterId) return;
-        const reason = prompt("¿Motivo para descartar esta foto maestra y todos sus recortes derivados?", "Outro publicitario / Texto / No apto para aprendizaje");
-        if (reason === null) return;
-        try {
-          const res = await fetch(`/api/master/${currentActiveMasterId}/reject`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ note: reason })
-          });
-          const data = await res.json();
-          if (data.success) {
-            document.getElementById('master-crop-modal').classList.remove('active');
-            loadMasterSnapshots();
-          }
-        } catch (err) {
-          console.error("Error rejecting master in modal:", err);
+      btnRejMasterModal.addEventListener('click', (e) => {
+        if (currentActiveMasterId) {
+          deleteMasterSnapshot(currentActiveMasterId, e);
         }
       });
     }
@@ -2334,6 +2947,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     // Init
+    setupBoundingBoxInteractivity();
     loadModels().then(() => {
       loadMasterSnapshots();
       loadSnapshots();
@@ -2356,6 +2970,7 @@ def create_app(db_path: Path) -> web.Application:
     app.router.add_get("/api/masters", studio.get_master_snapshots)
     app.router.add_get("/api/master/{id}/crops", studio.get_master_crops)
     app.router.add_post("/api/master/{id}/reject", studio.reject_master_snapshot)
+    app.router.add_post("/api/crop/{id}/reposition", studio.reposition_crop)
     app.router.add_get("/api/snapshots", studio.get_snapshots)
     app.router.add_get("/api/image/{id}", studio.get_image)
     app.router.add_post("/api/verify/{id}", studio.verify_snapshot)

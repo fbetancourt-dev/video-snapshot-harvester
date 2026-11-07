@@ -901,6 +901,8 @@ class SnapshotDatabaseManager:
                 cursor.execute("ALTER TABLE snapshots ADD COLUMN parent_snapshot_id INTEGER;")
             if "is_master_snapshot" not in cols:
                 cursor.execute("ALTER TABLE snapshots ADD COLUMN is_master_snapshot INTEGER DEFAULT 0;")
+            if "crop_bbox_json" not in cols:
+                cursor.execute("ALTER TABLE snapshots ADD COLUMN crop_bbox_json TEXT;")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_status ON snapshots(status);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_snap_parent ON snapshots(parent_snapshot_id);")
@@ -1639,6 +1641,121 @@ class AnatomicalZoneExtractor:
 
         return True
 
+class FramingAndCandidateEvaluator:
+    """
+    Evaluates frame framing, proximity, frontality, and visibility to ensure
+    only optimal frames are selected for specific anatomical extractions:
+    1. FACE CLOSE-UP: Frontal gaze (mirando de frente a cámara, NO de lado), sharp eyes/nose/mouth.
+    2. BUST & CHEST CLOSE-UP: Upper torso close to camera, clearly visible, unoccluded.
+    3. FULL BODY: Unoccluded full silhouette showing entire lower/upper limbs.
+    """
+
+    @staticmethod
+    def evaluate(
+        frame: np.ndarray,
+        rois: Dict[str, Any],
+        kpts: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        h, w = frame.shape[:2]
+        frame_area = float(h * w)
+
+        suitability = {
+            "can_extract_face": False,
+            "can_extract_chest_bust": False,
+            "can_extract_limbs_full_body": False,
+            "framing_label": "Plano General",
+            "face_proximity": 0.0,
+            "chest_proximity": 0.0,
+            "is_frontal_face": False
+        }
+
+        # 1. EVALUAR IDONEIDAD PARA ROSTRO / FACCIONES
+        face_roi = rois.get("face") if rois else None
+        if face_roi is not None and face_roi.size > 0:
+            fh, fw = face_roi.shape[:2]
+            face_area_ratio = float(fh * fw) / frame_area
+            suitability["face_proximity"] = round(face_area_ratio * 100.0, 2)
+
+            fgray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY) if len(face_roi.shape) == 3 else face_roi
+            face_lap = float(cv2.Laplacian(fgray, cv2.CV_64F).var())
+
+            # Frontalidad estricta (mirando de frente a la cámara y NO de lado)
+            is_frontal = False
+            if kpts is not None and len(kpts) >= 5:
+                nose, l_eye, r_eye = kpts[0], kpts[1], kpts[2]
+                if nose[2] >= 0.40 and l_eye[2] >= 0.40 and r_eye[2] >= 0.40:
+                    d_left = abs(nose[0] - l_eye[0])
+                    d_right = abs(r_eye[0] - nose[0])
+                    max_d = max(d_left, d_right) + 1e-4
+                    min_d = min(d_left, d_right) + 1e-4
+                    symmetry = min_d / max_d
+                    # Si symmetry < 0.45, la cabeza está girada o en perfil de lado
+                    is_frontal = (symmetry >= 0.45)
+
+                    # Inclinación de ojos horizontal
+                    dy = abs(l_eye[1] - r_eye[1])
+                    dx = abs(l_eye[0] - r_eye[0]) + 1e-4
+                    angle_deg = math.degrees(math.atan2(dy, dx))
+                    if angle_deg > 25.0:
+                        is_frontal = False
+            elif face_area_ratio >= 0.08:
+                is_frontal = True
+
+            suitability["is_frontal_face"] = is_frontal
+
+            # Criterio estricto de cara para facciones:
+            # - Mirando de frente (NO de lado)
+            # - Buen tamaño en encuadre (>= 75px)
+            # - Alta nitidez local (>= 70.0)
+            if fh >= 75 and fw >= 65 and face_lap >= 70.0 and is_frontal:
+                suitability["can_extract_face"] = True
+
+        # 2. EVALUAR IDONEIDAD PARA PECHO / BUSTO / TORSO CERCANO
+        torso_roi = rois.get("torso") if rois else None
+        if torso_roi is not None and torso_roi.size > 0:
+            th, tw = torso_roi.shape[:2]
+            torso_area_ratio = float(th * tw) / frame_area
+            suitability["chest_proximity"] = round(torso_area_ratio * 100.0, 2)
+
+            breast_part = torso_roi[:int(th * 0.55), :]
+            if breast_part.size > 0:
+                tgray = cv2.cvtColor(breast_part, cv2.COLOR_BGR2GRAY) if len(breast_part.shape) == 3 else breast_part
+                chest_lap = float(cv2.Laplacian(tgray, cv2.CV_64F).var())
+
+                has_shoulders = True
+                if kpts is not None and len(kpts) >= 7:
+                    has_shoulders = (kpts[5][2] >= 0.35 and kpts[6][2] >= 0.35)
+
+                if th >= 95 and tw >= 80 and chest_lap >= 38.0 and has_shoulders:
+                    suitability["can_extract_chest_bust"] = True
+
+        # 3. EVALUAR IDONEIDAD PARA EXTREMIDADES Y CUERPO COMPLETO
+        if kpts is not None and len(kpts) >= 17:
+            valid_kpts = [k for k in kpts if k[2] >= 0.35]
+            if len(valid_kpts) >= 8:
+                ys = [k[1] for k in valid_kpts]
+                vertical_coverage = (max(ys) - min(ys)) / float(h)
+
+                has_hips = (kpts[11][2] >= 0.35 and kpts[12][2] >= 0.35)
+                has_knees = (kpts[13][2] >= 0.35 or kpts[14][2] >= 0.35)
+                has_ankles = (kpts[15][2] >= 0.35 or kpts[16][2] >= 0.35)
+
+                if vertical_coverage >= 0.40 and has_hips and has_knees and has_ankles:
+                    suitability["can_extract_limbs_full_body"] = True
+
+        # Etiqueta descriptiva del encuadre
+        if suitability["can_extract_face"] and suitability["face_proximity"] >= 8.0:
+            suitability["framing_label"] = "Primer Plano Frontal (Close-Up Facial)"
+        elif suitability["can_extract_chest_bust"] and not suitability["can_extract_limbs_full_body"]:
+            suitability["framing_label"] = "Plano Medio (Pecho / Torso Visible)"
+        elif suitability["can_extract_limbs_full_body"]:
+            suitability["framing_label"] = "Cuerpo Completo (Full-Body Limbs)"
+        else:
+            suitability["framing_label"] = "Plano General"
+
+        return suitability
+
+
     @classmethod
     def extract_all_zones(
         cls,
@@ -1650,16 +1767,18 @@ class AnatomicalZoneExtractor:
         if frame is None or frame.size == 0:
             return zones
 
-        # 0. Full body snapshot (if reasonably clear)
-        if cls.is_sharp_and_clear(frame, min_laplacian=35.0):
+        # Evaluate candidate suitability by framing, proximity and frontality
+        suit = FramingAndCandidateEvaluator.evaluate(frame, rois_isolated, kpts=kpts)
+
+        # 0. Full body snapshot (ONLY if entire silhouette is visible)
+        if suit["can_extract_limbs_full_body"] and cls.is_sharp_and_clear(frame, min_laplacian=35.0):
             zones["cuerpo"] = frame.copy()
 
         # ==========================================
-        # 1. CRANEOFACIAL (cara, frente, cejas, ojos, nariz, boca, menton, oreja_izq, oreja_der, cabello)
+        # 1. CRANEOFACIAL (Solo si es candidato frontal, cercano y nítido)
         # ==========================================
         face_img = rois_isolated.get("face") if rois_isolated else None
-        # Strict sharpness & motion blur filter: Face MUST be sharp and clearly focused
-        if face_img is not None and face_img.size > 0 and cls.is_sharp_and_clear(face_img, min_laplacian=70.0):
+        if suit["can_extract_face"] and face_img is not None and face_img.size > 0 and cls.is_sharp_and_clear(face_img, min_laplacian=70.0):
             zones["cara"] = face_img
             fh, fw = face_img.shape[:2]
 
@@ -1708,10 +1827,10 @@ class AnatomicalZoneExtractor:
                 zones["cabello"] = cabello
 
         # ==========================================
-        # 2. TORSO, BUSTO, ESPALDA, OMBLIGO, CADERA
+        # 2. TORSO, BUSTO, ESPALDA, OMBLIGO, CADERA (Solo si pecho/torso es visible y cercano)
         # ==========================================
         torso_img = rois_isolated.get("torso") if rois_isolated else None
-        if torso_img is not None and torso_img.size > 0 and cls.is_valid_skin_and_texture(torso_img, min_skin_ratio=0.15):
+        if suit["can_extract_chest_bust"] and torso_img is not None and torso_img.size > 0 and cls.is_valid_skin_and_texture(torso_img, min_skin_ratio=0.15):
             zones["torso"] = torso_img
             th, tw = torso_img.shape[:2]
 
@@ -1751,7 +1870,7 @@ class AnatomicalZoneExtractor:
         # 3. PELVIS, ENTREPIERNA Y GLÚTEOS
         # ==========================================
         hg_img = rois_isolated.get("hips_glutes") if rois_isolated else None
-        if hg_img is not None and hg_img.size > 0 and cls.is_valid_skin_and_texture(hg_img, min_skin_ratio=0.15):
+        if (suit["can_extract_chest_bust"] or suit["can_extract_limbs_full_body"]) and hg_img is not None and hg_img.size > 0 and cls.is_valid_skin_and_texture(hg_img, min_skin_ratio=0.15):
             zones["pompi"] = hg_img
             hgh, hgw = hg_img.shape[:2]
 
@@ -1760,9 +1879,9 @@ class AnatomicalZoneExtractor:
                 zones["entrepierna"] = entrepierna
 
         # ==========================================
-        # 4. EXTREMIDADES GUIADAS POR KEYPOINTS COCO-17
+        # 4. EXTREMIDADES (Solo si la toma fuente es de cuerpo completo)
         # ==========================================
-        if kpts is not None and len(kpts) >= 17:
+        if suit["can_extract_limbs_full_body"] and kpts is not None and len(kpts) >= 17:
             # 4.1 Brazo Izquierdo (hombro 5, codo 7, muñeca 9)
             arm_l = [kpts[i] for i in [5, 7, 9] if kpts[i][2] >= 0.40]
             if len(arm_l) >= 2:
