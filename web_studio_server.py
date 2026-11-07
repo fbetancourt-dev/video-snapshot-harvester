@@ -1241,17 +1241,23 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     }
     .crop-resizer {
       position: absolute;
-      width: 10px;
-      height: 10px;
-      background: #38bdf8;
-      border: 1.5px solid #ffffff;
-      border-radius: 2px;
-      z-index: 12;
+      width: 12px;
+      height: 12px;
+      background: #ffffff;
+      border: 2px solid #0284c7;
+      border-radius: 50%;
+      z-index: 15;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.6);
+      transition: transform 0.1s ease;
     }
-    .crop-resizer.nw { top: -5px; left: -5px; cursor: nw-resize; }
-    .crop-resizer.ne { top: -5px; right: -5px; cursor: ne-resize; }
-    .crop-resizer.se { bottom: -5px; right: -5px; cursor: se-resize; }
-    .crop-resizer.sw { bottom: -5px; left: -5px; cursor: sw-resize; }
+    .crop-resizer:hover {
+      transform: scale(1.3);
+      background: #38bdf8;
+    }
+    .crop-resizer.nw { top: -6px; left: -6px; cursor: nwse-resize; }
+    .crop-resizer.ne { top: -6px; right: -6px; cursor: nesw-resize; }
+    .crop-resizer.se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+    .crop-resizer.sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
 
     #crop-highlight-label {
       position: absolute;
@@ -2148,52 +2154,53 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     let isResizingBox = false;
     let resizeDir = null;
     let dragStartX = 0, dragStartY = 0;
-    let boxStartLeft = 0, boxStartTop = 0, boxStartW = 0, boxStartH = 0;
+    let startRelX = 0, startRelY = 0, startRelW = 0, startRelH = 0;
 
     function setupBoundingBoxInteractivity() {
       const box = document.getElementById('crop-highlight-box');
       const img = document.getElementById('modal-master-img');
+      const label = document.getElementById('crop-highlight-label');
       const btnSave = document.getElementById('btn-save-reposition');
 
       if (!box || !img) return;
 
+      // 1. Arrastre de posición central: TRASLACIÓN PURA (el ancho y alto NUNCA cambian)
       box.addEventListener('mousedown', (e) => {
         if (e.target.classList.contains('crop-resizer')) return;
         e.preventDefault();
         e.stopPropagation();
 
+        if (!currentRelativeBbox) return;
+
         isDraggingBox = true;
         dragStartX = e.clientX;
         dragStartY = e.clientY;
 
-        const rect = box.getBoundingClientRect();
-        const imgRect = img.getBoundingClientRect();
-
-        boxStartLeft = rect.left - imgRect.left;
-        boxStartTop = rect.top - imgRect.top;
-        boxStartW = rect.width;
-        boxStartH = rect.height;
+        startRelX = currentRelativeBbox.rel_x;
+        startRelY = currentRelativeBbox.rel_y;
+        startRelW = currentRelativeBbox.rel_w;
+        startRelH = currentRelativeBbox.rel_h;
 
         box.classList.add('dragging');
       });
 
+      // 2. Redimensionamiento por tiradores de esquinas
       box.querySelectorAll('.crop-resizer').forEach(resizer => {
         resizer.addEventListener('mousedown', (e) => {
           e.preventDefault();
           e.stopPropagation();
+
+          if (!currentRelativeBbox) return;
 
           isResizingBox = true;
           resizeDir = resizer.dataset.dir;
           dragStartX = e.clientX;
           dragStartY = e.clientY;
 
-          const rect = box.getBoundingClientRect();
-          const imgRect = img.getBoundingClientRect();
-
-          boxStartLeft = rect.left - imgRect.left;
-          boxStartTop = rect.top - imgRect.top;
-          boxStartW = rect.width;
-          boxStartH = rect.height;
+          startRelX = currentRelativeBbox.rel_x;
+          startRelY = currentRelativeBbox.rel_y;
+          startRelW = currentRelativeBbox.rel_w;
+          startRelH = currentRelativeBbox.rel_h;
         });
       });
 
@@ -2202,61 +2209,69 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         const imgRect = img.getBoundingClientRect();
         if (imgRect.width <= 0 || imgRect.height <= 0) return;
 
-        const dx = e.clientX - dragStartX;
-        const dy = e.clientY - dragStartY;
+        const dRelX = (e.clientX - dragStartX) / imgRect.width;
+        const dRelY = (e.clientY - dragStartY) / imgRect.height;
 
-        let newLeft = boxStartLeft;
-        let newTop = boxStartTop;
-        let newW = boxStartW;
-        let newH = boxStartH;
+        let rel_x = startRelX;
+        let rel_y = startRelY;
+        let rel_w = startRelW;
+        let rel_h = startRelH;
 
         if (isDraggingBox) {
-          newLeft = Math.max(0, Math.min(imgRect.width - newW, boxStartLeft + dx));
-          newTop = Math.max(0, Math.min(imgRect.height - newH, boxStartTop + dy));
+          // CASO 1: Mover rectángulo -> EL TAMAÑO NUNCA CAMBIA
+          rel_w = startRelW;
+          rel_h = startRelH;
+          rel_x = Math.max(0, Math.min(1 - rel_w, startRelX + dRelX));
+          rel_y = Math.max(0, Math.min(1 - rel_h, startRelY + dRelY));
         } else if (isResizingBox) {
-          const minSize = 24;
+          // CASO 2: Redimensionar esquina -> La esquina opuesta permanece FIJA
+          const minRelW = Math.max(0.015, 20 / imgRect.width);
+          const minRelH = Math.max(0.015, 20 / imgRect.height);
+
           if (resizeDir === 'se') {
-            newW = Math.max(minSize, Math.min(imgRect.width - newLeft, boxStartW + dx));
-            newH = Math.max(minSize, Math.min(imgRect.height - newTop, boxStartH + dy));
-          } else if (resizeDir === 'sw') {
-            const rawW = boxStartW - dx;
-            if (rawW >= minSize && boxStartLeft + dx >= 0) {
-              newLeft = boxStartLeft + dx;
-              newW = rawW;
-            }
-            newH = Math.max(minSize, Math.min(imgRect.height - newTop, boxStartH + dy));
-          } else if (resizeDir === 'ne') {
-            newW = Math.max(minSize, Math.min(imgRect.width - newLeft, boxStartW + dx));
-            const rawH = boxStartH - dy;
-            if (rawH >= minSize && boxStartTop + dy >= 0) {
-              newTop = boxStartTop + dy;
-              newH = rawH;
-            }
+            rel_x = startRelX;
+            rel_y = startRelY;
+            rel_w = Math.max(minRelW, Math.min(1 - startRelX, startRelW + dRelX));
+            rel_h = Math.max(minRelH, Math.min(1 - startRelY, startRelH + dRelY));
           } else if (resizeDir === 'nw') {
-            const rawW = boxStartW - dx;
-            if (rawW >= minSize && boxStartLeft + dx >= 0) {
-              newLeft = boxStartLeft + dx;
-              newW = rawW;
-            }
-            const rawH = boxStartH - dy;
-            if (rawH >= minSize && boxStartTop + dy >= 0) {
-              newTop = boxStartTop + dy;
-              newH = rawH;
-            }
+            const targetX = Math.max(0, Math.min(startRelX + startRelW - minRelW, startRelX + dRelX));
+            const targetY = Math.max(0, Math.min(startRelY + startRelH - minRelH, startRelY + dRelY));
+            rel_x = targetX;
+            rel_y = targetY;
+            rel_w = (startRelX + startRelW) - targetX;
+            rel_h = (startRelY + startRelH) - targetY;
+          } else if (resizeDir === 'ne') {
+            rel_x = startRelX;
+            const targetY = Math.max(0, Math.min(startRelY + startRelH - minRelH, startRelY + dRelY));
+            rel_y = targetY;
+            rel_w = Math.max(minRelW, Math.min(1 - startRelX, startRelW + dRelX));
+            rel_h = (startRelY + startRelH) - targetY;
+          } else if (resizeDir === 'sw') {
+            const targetX = Math.max(0, Math.min(startRelX + startRelW - minRelW, startRelX + dRelX));
+            rel_x = targetX;
+            rel_y = startRelY;
+            rel_w = (startRelX + startRelW) - targetX;
+            rel_h = Math.max(minRelH, Math.min(1 - startRelY, startRelH + dRelY));
           }
         }
 
-        const rel_x = newLeft / imgRect.width;
-        const rel_y = newTop / imgRect.height;
-        const rel_w = newW / imgRect.width;
-        const rel_h = newH / imgRect.height;
-
+        // Aplicar estilos a la caja en %
         box.style.left = `${(rel_x * 100).toFixed(2)}%`;
         box.style.top = `${(rel_y * 100).toFixed(2)}%`;
         box.style.width = `${(rel_w * 100).toFixed(2)}%`;
         box.style.height = `${(rel_h * 100).toFixed(2)}%`;
 
         currentRelativeBbox = { rel_x, rel_y, rel_w, rel_h };
+
+        // Actualizar etiqueta con resolución nativa en píxeles reales
+        const crop = currentModalCrops.find(c => c.id === currentActiveCropId);
+        if (crop && label) {
+          const natW = img.naturalWidth || 1920;
+          const natH = img.naturalHeight || 1080;
+          const curPxW = Math.round(rel_w * natW);
+          const curPxH = Math.round(rel_h * natH);
+          label.textContent = `${crop.zone_type} (${curPxW}x${curPxH}px)`;
+        }
 
         if (btnSave) {
           btnSave.style.display = 'block';
