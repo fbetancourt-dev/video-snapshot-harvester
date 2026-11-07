@@ -2693,7 +2693,11 @@ class VideoSnapshotHarvester:
         t_end = self.parse_time_str(end_time) if end_time else (duration if duration > 0 else 600.0)
         effective_duration = max(1.0, t_end - t_start)
 
-        num_situations = max(1, min(num_situations, self.max_snapshots))
+        if num_situations <= 0 or getattr(self, "per_minute", False):
+            # Exactly 1 snapshot per minute of video duration
+            num_situations = max(1, int(round(effective_duration / 60.0)))
+        else:
+            num_situations = max(1, min(num_situations, self.max_snapshots))
         window_duration = effective_duration / num_situations
 
         cap = cv2.VideoCapture(str(vid_path))
@@ -2753,25 +2757,23 @@ class VideoSnapshotHarvester:
                     prev_sample = frame
 
                 if best_frame is not None and best_score > 0.0:
-                    is_dup, dist = self.dedup.is_duplicate(best_frame)
-                    if not is_dup:
-                        rois_isolated = {}
-                        kpts = None
-                        if self.crop_regions and self.somatotype_extractor:
-                            r_data = self.somatotype_extractor.extract_keypoint_rois(best_frame)
-                            rois_isolated = r_data.get("rois", {})
-                            kpts = r_data.get("kpts", None)
+                    rois_isolated = {}
+                    kpts = None
+                    if self.crop_regions and self.somatotype_extractor:
+                        r_data = self.somatotype_extractor.extract_keypoint_rois(best_frame)
+                        rois_isolated = r_data.get("rois", {})
+                        kpts = r_data.get("kpts", None)
 
-                        metrics = {
-                            "studio_score": best_score,
-                            "sharpness": best_meta.get("sharpness", 0.0),
-                            "brightness": best_meta.get("brightness", 0.0),
-                            "contrast": best_meta.get("contrast", 0.0)
-                        }
+                    metrics = {
+                        "studio_score": best_score,
+                        "sharpness": best_meta.get("sharpness", 0.0),
+                        "brightness": best_meta.get("brightness", 0.0),
+                        "contrast": best_meta.get("contrast", 0.0)
+                    }
 
-                        saved = self._save_snapshot_and_records(best_frame, stem, vid_path, best_sec, metrics, rois_isolated, kpts=kpts)
-                        all_records.extend(saved)
-                        preview_frames_for_sheet.append((best_frame, saved[0]))
+                    saved = self._save_snapshot_and_records(best_frame, stem, vid_path, best_sec, metrics, rois_isolated, kpts=kpts)
+                    all_records.extend(saved)
+                    preview_frames_for_sheet.append((best_frame, saved[0]))
 
         finally:
             cap.release()
@@ -3147,6 +3149,7 @@ def main():
     # Studio & Situation Discovery Options
     parser.add_argument("--studio", action="store_true", help="Enable Studio Quality Mode: selects peak flattering studio moments across diverse situations")
     parser.add_argument("--situations", type=int, default=8, help="Number of diverse situations/scenes to discover across video (default: 8)")
+    parser.add_argument("--per-minute", action="store_true", help="Harvest exactly 1 snapshot per minute across the entire video duration")
     parser.add_argument("--timestamps", help="Comma-separated explicit timestamps to harvest (e.g. '00:01:25,00:04:12.5')")
     parser.add_argument("--contact-sheet", action="store_true", help="Generate a studio contact sheet grid image (STUDIO_CONTACT_SHEET.jpg)")
 
@@ -3343,7 +3346,7 @@ def main():
                 if harvester.studio_mode or args.studio:
                     result = harvester.harvest_studio_situations(
                         video_input=local_sources[0],
-                        num_situations=args.situations_per_video or args.situations,
+                        num_situations=0 if args.per_minute else (args.situations_per_video or args.situations),
                         start_time=args.start,
                         end_time=args.end
                     )
