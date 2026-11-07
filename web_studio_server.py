@@ -276,7 +276,7 @@ class WebStudioApp:
         video = request.query.get("video", "all")
         status = request.query.get("status", "all")
         page = max(1, int(request.query.get("page", 1)))
-        limit = max(1, min(100, int(request.query.get("limit", 24))))
+        limit = max(1, min(1000, int(request.query.get("limit", 100))))
         offset = (page - 1) * limit
 
         def _fetch_masters():
@@ -1416,7 +1416,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="tabs-nav">
       <button class="tab-btn active" data-tab="tab-masters">🎬 Fuentes: Videos & Galerías</button>
       <button class="tab-btn" data-tab="tab-atlas">✂️ Triage por Zonas (32 Zonas)</button>
-      <button class="tab-btn" data-tab="tab-video">🎬 Videos & Timeline</button>
+      <button class="tab-btn" data-tab="tab-video">🎞️ Curaduría de Fotogramas</button>
       <button class="tab-btn" data-tab="tab-search">🔍 Buscador Contextual</button>
       <button class="tab-btn" data-tab="tab-memory">🧠 Memoria AGY</button>
       <button class="tab-btn" data-tab="tab-harvest">🚀 Cosecha & Entrenar</button>
@@ -1537,39 +1537,62 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- TAB 2: VIDEOS & TIMELINE POR MINUTO -->
+    <!-- TAB 2: CURADURÍA RÁPIDA DE FOTOGRAMAS (NIVEL VIDEO / GALERÍA) -->
     <div id="tab-video" class="tab-pane">
       <div class="filter-bar">
         <div class="form-group" style="flex: 1; max-width: 450px;">
-          <label for="video-select">Seleccionar Video Recolectado</label>
+          <label for="video-select">Seleccionar Video o Galería</label>
           <select id="video-select" style="width: 100%;">
-            <option value="">-- Elige un video --</option>
+            <option value="">-- Elige una fuente --</option>
           </select>
         </div>
-        <div style="margin-left: auto; display: flex; align-items: center; gap: 0.5rem;">
-          <span id="video-stat" style="font-size: 0.85rem; color: var(--text-muted);">HTTP 206 Streaming Activo</span>
+        <div class="form-group">
+          <label for="curator-status-filter">Filtrar Estado</label>
+          <select id="curator-status-filter">
+            <option value="pending" selected>Pendientes de Decisión ⏳</option>
+            <option value="all">Todos los Fotogramas</option>
+            <option value="verified">Conservados / Aprobados ✔</option>
+            <option value="rejected">Descartados ❌</option>
+          </select>
+        </div>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 0.6rem;">
+          <span id="curator-meta-badge" style="font-size: 0.85rem; color: #38bdf8; font-weight: 600;">0 fotogramas</span>
         </div>
       </div>
 
-      <div class="video-view-container">
-        <div class="player-box">
-          <video id="video-player" controls preload="metadata">
-            Tu navegador no soporta reproducción directa de video HTML5.
-          </video>
-          <div id="video-now-playing" style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);"></div>
+      <!-- VISOR PRINCIPAL DE FOTOGRAMA COMPLETO HD -->
+      <div style="background: #0b1120; border: 1px solid #1e293b; border-radius: 8px; padding: 1rem; display: flex; flex-direction: column; gap: 0.8rem;">
+        
+        <!-- Barra de herramientas del fotograma actual -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+          <div>
+            <span id="curator-frame-title" style="font-size: 1.05rem; font-weight: 700; color: #f8fafc;">Selecciona un video o galería</span>
+            <span id="curator-frame-meta" style="font-size: 0.8rem; color: #64748b; margin-left: 0.5rem;"></span>
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <button id="btn-curator-prev" class="btn btn-secondary" style="padding: 0.4rem 0.8rem;" title="Fotograma anterior (←)">◀ Anterior</button>
+            <button id="btn-curator-keep" class="btn btn-success" style="padding: 0.4rem 0.9rem; font-weight: 600;" title="Conservar fotograma para entrenamiento">✔ Conservar</button>
+            <button id="btn-curator-reject" class="btn btn-danger" style="padding: 0.4rem 0.9rem; font-weight: 600; background: #dc2626;" title="Descartar fotograma (Supr)">🗑️ Descartar Fotograma</button>
+            <button id="btn-curator-next" class="btn btn-secondary" style="padding: 0.4rem 0.8rem;" title="Siguiente fotograma (→)">Siguiente ▶</button>
+          </div>
         </div>
 
-        <div class="timeline-container">
-          <div class="timeline-header">
-            <div>
-              <h3 style="font-size: 1.1rem; font-weight: 600;">⏱️ Línea de Tiempo Escénica (1 Snapshot por Minuto)</h3>
-              <p style="font-size: 0.8rem; color: var(--text-muted);">Haz clic en cualquier minuto para saltar la reproducción a ese instante exacto.</p>
-            </div>
-            <span id="timeline-count" style="font-size: 0.85rem; color: #60a5fa;">0 escenas indexadas</span>
+        <!-- Canvas / Imagen Completa del Fotograma en Grande -->
+        <div style="min-height: 440px; max-height: 580px; background: #020617; border-radius: 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative;">
+          <img id="curator-full-frame" src="" alt="Fotograma Completo" style="max-width: 100%; max-height: 560px; object-fit: contain; display: none;">
+          <div id="curator-empty-placeholder" style="color: #64748b; font-size: 0.95rem; text-align: center; padding: 3rem;">
+            🎬 Selecciona un video o galería para inspeccionar sus fotogramas completos y decidir cuáles conservar o descartar.
           </div>
+        </div>
 
-          <div id="timeline-scroller" class="timeline-scroll">
-            <!-- Timeline Cards inserted via JS -->
+        <!-- Tira de Fotogramas del Video (Filmstrip inferior) -->
+        <div style="background: #030712; border: 1px solid #1e293b; border-radius: 6px; padding: 0.6rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+            <span style="font-size: 0.8rem; color: #94a3b8; font-weight: 600;">🎞️ Tira Cronológica del Video (<span id="curator-strip-count">0</span> fotogramas) — Haz clic en cualquier frame o descarta con 🗑️:</span>
+            <span style="font-size: 0.75rem; color: #64748b;">Atajos: Flechas ← / → navegar | Supr: descartar</span>
+          </div>
+          <div id="curator-filmstrip-scroller" style="display: flex; gap: 0.6rem; overflow-x: auto; padding-bottom: 0.4rem; scroll-behavior: smooth; min-height: 95px;">
+            <!-- Miniaturas inyectadas dinámicamente -->
           </div>
         </div>
       </div>
@@ -1816,7 +1839,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         } else if (tabId === 'tab-atlas') {
           loadSnapshots();
         } else if (tabId === 'tab-video') {
-          loadVideosList();
+          loadCuratorSources();
         } else if (tabId === 'tab-memory') {
           loadAgyMemory();
         }
@@ -2639,94 +2662,283 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     });
 
     // ==========================================
-    // Video Player & Minute Timeline Logic
+    // Rapid Full-Frame Curator Logic (tab-video)
     // ==========================================
-    async function loadVideosList() {
-      const select = document.getElementById('video-select');
-      try {
-        const res = await fetch(`/api/videos?model=${currentModel}`);
-        const data = await res.json();
-        select.innerHTML = '<option value="">-- Elige un video --</option>';
+    let curatorSources = [];
+    let curatorFrames = [];
+    let curatorIndex = -1;
+    let curatorCurrentSource = "";
 
-        (data.videos || []).forEach(v => {
+    async function loadCuratorSources() {
+      const select = document.getElementById('video-select');
+      if (!select) return;
+      try {
+        const res = await fetch('/api/sources');
+        const data = await res.json();
+        curatorSources = data.sources || [];
+
+        select.innerHTML = '<option value="">-- Elige un video o galería --</option>';
+        curatorSources.forEach(s => {
+          const icon = s.source_type === 'video' ? '🎬' : '🖼️';
           const opt = document.createElement('option');
-          opt.value = v.filename;
-          opt.textContent = `${v.filename} (${v.scenes_count} min indexados)`;
-          opt.setAttribute('data-path', v.path || '');
+          opt.value = s.source_video;
+          opt.textContent = `${icon} ${s.source_video} (${s.model_name} • ${s.frame_count} frames)`;
           select.appendChild(opt);
         });
 
-        if (data.videos && data.videos.length > 0) {
+        if (curatorCurrentSource && curatorSources.some(s => s.source_video === curatorCurrentSource)) {
+          select.value = curatorCurrentSource;
+        } else if (curatorSources.length > 0) {
           select.selectedIndex = 1;
-          onVideoSelected();
         }
+        onCuratorSourceSelected();
       } catch (err) {
-        console.error("Error loading videos:", err);
+        console.error("Error loading curator sources:", err);
       }
     }
 
-    document.getElementById('video-select').addEventListener('change', onVideoSelected);
+    document.getElementById('video-select').addEventListener('change', onCuratorSourceSelected);
+    document.getElementById('curator-status-filter').addEventListener('change', () => {
+      if (curatorCurrentSource) {
+        loadCuratorFrames(curatorCurrentSource);
+      }
+    });
 
-    function onVideoSelected() {
+    function onCuratorSourceSelected() {
       const select = document.getElementById('video-select');
-      const filename = select.value;
-      if (!filename) return;
-
-      const player = document.getElementById('video-player');
-      const streamUrl = `/api/video/stream?filename=${encodeURIComponent(filename)}`;
-      player.src = streamUrl;
-      document.getElementById('video-now-playing').textContent = `Reproduciendo: ${filename}`;
-
-      loadTimelineForVideo(filename);
+      const sourceVideo = select ? select.value : "";
+      curatorCurrentSource = sourceVideo;
+      if (!sourceVideo) {
+        curatorFrames = [];
+        curatorIndex = -1;
+        renderCuratorView();
+        return;
+      }
+      loadCuratorFrames(sourceVideo);
     }
 
-    async function loadTimelineForVideo(filename) {
-      const scroller = document.getElementById('timeline-scroller');
-      scroller.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">Cargando escenas...</div>';
+    async function loadCuratorFrames(sourceVideo) {
+      const statusFilter = document.getElementById('curator-status-filter').value;
+      const badge = document.getElementById('curator-meta-badge');
+      if (badge) badge.textContent = "Cargando fotogramas...";
 
       try {
-        const res = await fetch(`/api/video/scenes?video=${encodeURIComponent(filename)}`);
+        const statusParam = statusFilter !== 'all' ? `&status=${encodeURIComponent(statusFilter)}` : '';
+        const res = await fetch(`/api/masters?video=${encodeURIComponent(sourceVideo)}&limit=500${statusParam}`);
         const data = await res.json();
-        const scenes = data.scenes || [];
-
-        document.getElementById('timeline-count').textContent = `${scenes.length} escenas por minuto`;
-        scroller.innerHTML = '';
-
-        if (scenes.length === 0) {
-          scroller.innerHTML = '<div style="color: var(--text-muted); padding: 1rem;">No hay escenas por minuto extraídas aún para este video.</div>';
-          return;
-        }
-
-        scenes.forEach(s => {
-          const card = document.createElement('div');
-          card.className = 'timeline-card';
-          card.id = `timeline-card-${s.id}`;
-          card.innerHTML = `
-            <img class="timeline-thumb" src="/api/video/scene_image/${s.id}" alt="Minuto ${s.minute_index}">
-            <div class="timeline-body">
-              <div class="timeline-time">
-                <span>Min ${s.minute_index}</span>
-                <span>${s.timestamp_str}</span>
-              </div>
-              <div class="timeline-desc" title="${s.scene_description}">${s.scene_description}</div>
-            </div>
-          `;
-
-          card.addEventListener('click', () => {
-            document.querySelectorAll('.timeline-card').forEach(c => c.classList.remove('active'));
-            card.classList.add('active');
-
-            const player = document.getElementById('video-player');
-            player.currentTime = s.timestamp_sec;
-            player.play();
-          });
-
-          scroller.appendChild(card);
-        });
+        curatorFrames = data.masters || [];
+        curatorIndex = curatorFrames.length > 0 ? 0 : -1;
+        renderCuratorView();
       } catch (err) {
-        scroller.innerHTML = `<div style="color: var(--danger); padding: 1rem;">Error cargando timeline: ${err.message}</div>`;
+        console.error("Error loading curator frames:", err);
+        if (badge) badge.textContent = "Error al cargar";
       }
     }
+
+    function renderCuratorView() {
+      const total = curatorFrames.length;
+      const badge = document.getElementById('curator-meta-badge');
+      const stripCount = document.getElementById('curator-strip-count');
+      if (badge) badge.textContent = `${total} fotogramas disponibles`;
+      if (stripCount) stripCount.textContent = total;
+
+      const scroller = document.getElementById('curator-filmstrip-scroller');
+      scroller.innerHTML = '';
+
+      if (total === 0) {
+        document.getElementById('curator-full-frame').style.display = 'none';
+        const placeholder = document.getElementById('curator-empty-placeholder');
+        placeholder.style.display = 'block';
+        placeholder.innerHTML = '✨ No hay fotogramas para mostrar con el filtro actual o la fuente no tiene frames cargados.';
+        document.getElementById('curator-frame-title').textContent = 'Sin fotogramas disponibles';
+        document.getElementById('curator-frame-meta').textContent = '';
+        return;
+      }
+
+      curatorFrames.forEach((f, idx) => {
+        const thumb = document.createElement('div');
+        thumb.className = `curator-thumb-card ${idx === curatorIndex ? 'active' : ''}`;
+        thumb.id = `curator-thumb-${f.id}`;
+        const borderColor = idx === curatorIndex ? '#38bdf8' : (f.status === 'verified' ? '#22c55e' : (f.status === 'rejected' ? '#ef4444' : '#334155'));
+        thumb.style.cssText = `
+          flex: 0 0 110px;
+          background: #0f172a;
+          border: 2px solid ${borderColor};
+          border-radius: 6px;
+          overflow: hidden;
+          cursor: pointer;
+          position: relative;
+          transition: transform 0.15s ease, border-color 0.15s ease;
+        `;
+
+        const timeTag = f.timestamp_str || `Frame ${idx + 1}`;
+        thumb.innerHTML = `
+          <img src="/api/image/${f.id}" style="width: 100%; height: 65px; object-fit: cover; display: block;" loading="lazy">
+          <div style="display: flex; justify-content: space-between; align-items: center; padding: 2px 4px; background: rgba(0,0,0,0.85); font-size: 0.7rem;">
+            <span style="color: #cbd5e1; font-weight: 600;">${timeTag}</span>
+            <button class="btn-curator-thumb-del" data-id="${f.id}" title="Descartar frame (Supr)" style="background: none; border: none; color: #ef4444; font-size: 0.8rem; cursor: pointer; padding: 0 2px;">🗑️</button>
+          </div>
+        `;
+
+        thumb.addEventListener('click', (e) => {
+          if (e.target.closest('.btn-curator-thumb-del')) {
+            e.stopPropagation();
+            discardCuratorFrame(f.id);
+            return;
+          }
+          selectCuratorFrameIndex(idx);
+        });
+
+        scroller.appendChild(thumb);
+      });
+
+      if (curatorIndex >= 0 && curatorIndex < total) {
+        showCuratorFrame(curatorIndex);
+      }
+    }
+
+    function selectCuratorFrameIndex(idx) {
+      if (idx < 0 || idx >= curatorFrames.length) return;
+      curatorIndex = idx;
+
+      document.querySelectorAll('#curator-filmstrip-scroller .curator-thumb-card').forEach((el, i) => {
+        const f = curatorFrames[i];
+        if (i === idx) {
+          el.style.borderColor = '#38bdf8';
+          el.style.transform = 'scale(1.04)';
+          el.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+        } else {
+          el.style.borderColor = f.status === 'verified' ? '#22c55e' : (f.status === 'rejected' ? '#ef4444' : '#334155');
+          el.style.transform = 'scale(1)';
+        }
+      });
+
+      showCuratorFrame(idx);
+    }
+
+    function showCuratorFrame(idx) {
+      const f = curatorFrames[idx];
+      if (!f) return;
+
+      const img = document.getElementById('curator-full-frame');
+      const placeholder = document.getElementById('curator-empty-placeholder');
+      const title = document.getElementById('curator-frame-title');
+      const meta = document.getElementById('curator-frame-meta');
+
+      placeholder.style.display = 'none';
+      img.style.display = 'block';
+      img.src = `/api/image/${f.id}`;
+
+      const timeStr = f.timestamp_str ? `[${f.timestamp_str}]` : '';
+      title.textContent = `${f.source_video} — Fotograma #${f.id} ${timeStr}`;
+
+      const statusBadge = f.status === 'verified' ? '✔ Conservado' : (f.status === 'rejected' ? '❌ Descartado' : '⏳ Pendiente');
+      const rawScore = f.studio_score !== undefined ? f.studio_score : 50;
+      const qualityPct = rawScore > 1.0 ? Math.round(rawScore) : Math.round(rawScore * 100);
+      meta.textContent = `(${idx + 1} de ${curatorFrames.length}) • Estado: ${statusBadge} • Nitidez: ${Math.round(f.sharpness || 0)} • Calidad: ${qualityPct}% • ${f.crops_count || 0} recortes`;
+    }
+
+    async function discardCuratorFrame(frameId) {
+      try {
+        const res = await fetch(`/api/master/${frameId}/reject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note: 'Descarte rápido de fotograma en curaduría de video' })
+        });
+        const data = await res.json();
+        if (data.success) {
+          const f = curatorFrames.find(item => item.id === frameId);
+          if (f) f.status = 'rejected';
+
+          const statusFilter = document.getElementById('curator-status-filter').value;
+          if (statusFilter === 'pending') {
+            const oldIdx = curatorFrames.findIndex(item => item.id === frameId);
+            curatorFrames = curatorFrames.filter(item => item.id !== frameId);
+            if (curatorIndex >= curatorFrames.length) {
+              curatorIndex = curatorFrames.length - 1;
+            }
+            renderCuratorView();
+          } else {
+            renderCuratorView();
+          }
+        }
+      } catch (err) {
+        console.error("Error descartando frame:", err);
+      }
+    }
+
+    async function keepCuratorFrame(frameId) {
+      try {
+        const res = await fetch(`/api/verify/${frameId}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          const f = curatorFrames.find(item => item.id === frameId);
+          if (f) f.status = 'verified';
+
+          const statusFilter = document.getElementById('curator-status-filter').value;
+          if (statusFilter === 'pending') {
+            curatorFrames = curatorFrames.filter(item => item.id !== frameId);
+            if (curatorIndex >= curatorFrames.length) {
+              curatorIndex = curatorFrames.length - 1;
+            }
+            renderCuratorView();
+          } else {
+            if (curatorIndex < curatorFrames.length - 1) {
+              selectCuratorFrameIndex(curatorIndex + 1);
+            } else {
+              renderCuratorView();
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error conservando frame:", err);
+      }
+    }
+
+    // Action Buttons
+    document.getElementById('btn-curator-prev').addEventListener('click', () => {
+      if (curatorIndex > 0) selectCuratorFrameIndex(curatorIndex - 1);
+    });
+    document.getElementById('btn-curator-next').addEventListener('click', () => {
+      if (curatorIndex < curatorFrames.length - 1) selectCuratorFrameIndex(curatorIndex + 1);
+    });
+    document.getElementById('btn-curator-keep').addEventListener('click', () => {
+      if (curatorIndex >= 0 && curatorIndex < curatorFrames.length) {
+        keepCuratorFrame(curatorFrames[curatorIndex].id);
+      }
+    });
+    document.getElementById('btn-curator-reject').addEventListener('click', () => {
+      if (curatorIndex >= 0 && curatorIndex < curatorFrames.length) {
+        discardCuratorFrame(curatorFrames[curatorIndex].id);
+      }
+    });
+
+    // Keyboard Shortcuts for Rapid Curating
+    document.addEventListener('keydown', (e) => {
+      const activeTab = document.querySelector('.tab-pane.active');
+      if (!activeTab || activeTab.id !== 'tab-video') return;
+
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (curatorIndex > 0) selectCuratorFrameIndex(curatorIndex - 1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (curatorIndex < curatorFrames.length - 1) selectCuratorFrameIndex(curatorIndex + 1);
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        if (curatorIndex >= 0 && curatorIndex < curatorFrames.length) {
+          discardCuratorFrame(curatorFrames[curatorIndex].id);
+        }
+      } else if (e.key === 'Enter' || e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        if (curatorIndex >= 0 && curatorIndex < curatorFrames.length) {
+          keepCuratorFrame(curatorFrames[curatorIndex].id);
+        }
+      }
+    });
 
     // ==========================================
     // Contextual Search Logic
